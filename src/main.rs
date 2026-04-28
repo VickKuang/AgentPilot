@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs,
+    env, fs,
     net::SocketAddr,
     path::Path,
     sync::Arc,
@@ -9,10 +9,11 @@ use std::{
 
 use axum::{
     extract::{Path as AxumPath, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{HeaderMap, Method, Request, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, patch, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -22,10 +23,55 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 const STORE_FILE: &str = "data/store.json";
+const DEFAULT_API_KEY: &str = "dev-admin-key";
+const DEFAULT_TENANT: &str = "public";
+const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 120;
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<RwLock<Store>>,
+    security: Arc<SecurityState>,
+    rate_limiter: Arc<RwLock<HashMap<String, RateLimitWindow>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum UserRole {
+    Admin,
+    Operator,
+    Viewer,
+}
+
+#[derive(Debug, Clone)]
+struct ApiCredential {
+    key_id: String,
+    api_key: String,
+    role: UserRole,
+    tenant_scope: Option<String>,
+    user_id: String,
+    kms_key_ref: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SecurityState {
+    credentials: Vec<ApiCredential>,
+    rate_limit_per_minute: u32,
+    kms_provider: String,
+}
+
+#[derive(Debug, Clone)]
+struct RateLimitWindow {
+    count: u32,
+    window_started_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct AuthContext {
+    key_id: String,
+    user_id: String,
+    tenant_id: String,
+    role: UserRole,
+    kms_key_ref: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize, Clone)]
@@ -34,6 +80,8 @@ struct Store {
     reports: HashMap<Uuid, TestReport>,
     tool_calls: HashMap<Uuid, Vec<ToolCallLog>>,
     snapshots: HashMap<Uuid, Vec<PageSnapshot>>,
+    #[serde(default)]
+    audit_logs: Vec<AuditLog>,
 }
 
 impl Store {
@@ -83,6 +131,10 @@ enum ActionType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TestTask {
     task_id: Uuid,
+    #[serde(default = "default_tenant")]
+    tenant_id: String,
+    #[serde(default)]
+    created_by: String,
     task_name: String,
     user_goal: String,
     scenario: String,
@@ -129,6 +181,8 @@ struct StepLog {
 struct TestReport {
     report_id: Uuid,
     task_id: Uuid,
+    #[serde(default = "default_tenant")]
+    tenant_id: String,
     result: TaskStatus,
     summary: String,
     issue_summary: String,
@@ -173,6 +227,19 @@ struct PageSnapshot {
     screenshot_url: String,
     page_tree: serde_json::Value,
     current_page: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuditLog {
+    id: Uuid,
+    tenant_id: String,
+    user_id: String,
+    role: UserRole,
+    action: String,
+    resource: String,
+    success: bool,
+    detail: serde_json::Value,
     created_at: DateTime<Utc>,
 }
 
@@ -221,18 +288,97 @@ impl IntoResponse for ApiError {
     }
 }
 
+fn default_tenant() -> String {
+    DEFAULT_TENANT.to_string()
+}
+
+impl SecurityState {
+    fn load() -> Self {
+        #[derive(Deserialize)]
+        struct RawCredential {
+            key_id: String,
+            api_key: String,
+            role: UserRole,
+            tenant_scope: Option<String>,
+            user_id: Option<String>,
+            kms_key_ref: Option<String>,
+        }
+
+        let credentials = env::var("AUTOTEST_API_CREDENTIALS")
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Vec<RawCredential>>(&raw).ok())
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| ApiCredential {
+                        key_id: row.key_id.clone(),
+                        api_key: row.api_key,
+                        role: row.role,
+                        tenant_scope: row.tenant_scope,
+                        user_id: row.user_id.unwrap_or(row.key_id),
+                        kms_key_ref: row.kms_key_ref,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|x| !x.is_empty())
+            .unwrap_or_else(|| {
+                vec![ApiCredential {
+                    key_id: "dev-admin".to_string(),
+                    api_key: DEFAULT_API_KEY.to_string(),
+                    role: UserRole::Admin,
+                    tenant_scope: None,
+                    user_id: "local_admin".to_string(),
+                    kms_key_ref: Some("local-kms/dev-main-key".to_string()),
+                }]
+            });
+
+        let rate_limit_per_minute = env::var("AUTOTEST_RATE_LIMIT_PER_MINUTE")
+            .ok()
+            .and_then(|x| x.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_RATE_LIMIT_PER_MINUTE);
+        let kms_provider =
+            env::var("AUTOTEST_KMS_PROVIDER").unwrap_or_else(|_| "local-kms".to_string());
+
+        Self {
+            credentials,
+            rate_limit_per_minute,
+            kms_provider,
+        }
+    }
+}
+
+fn role_allowed(role: &UserRole, method: &Method) -> bool {
+    match role {
+        UserRole::Admin => true,
+        UserRole::Operator => method != Method::DELETE,
+        UserRole::Viewer => method == Method::GET,
+    }
+}
+
+fn ensure_tenant_access(resource_tenant: &str, actor: &AuthContext) -> Result<(), ApiError> {
+    if resource_tenant == actor.tenant_id {
+        Ok(())
+    } else {
+        Err(ApiError {
+            code: "tenant_forbidden",
+            message: "resource does not belong to current tenant".to_string(),
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    let security = Arc::new(SecurityState::load());
     let state = AppState {
         store: Arc::new(RwLock::new(Store::load())),
+        security,
+        rate_limiter: Arc::new(RwLock::new(HashMap::new())),
     };
 
-    let app = Router::new()
-        .route("/health", get(health))
+    let protected_api = Router::new()
         .route("/api/v1/tasks", post(create_task).get(list_tasks))
         .route("/api/v1/tasks/:task_id", get(get_task))
         .route("/api/v1/tasks/:task_id/data", patch(update_task_data))
@@ -251,6 +397,16 @@ async fn main() {
             "/api/v1/tasks/:task_id/report/export",
             get(export_report_markdown),
         )
+        .route("/api/v1/audit-logs", get(get_audit_logs))
+        .route("/api/v1/security/context", get(get_security_context))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .merge(protected_api)
         .nest_service("/", ServeDir::new("web"))
         .with_state(state);
 
@@ -265,8 +421,102 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok", "service": "autotest-agent"}))
 }
 
+async fn auth_middleware(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|x| x.to_str().ok())
+        .unwrap_or_default();
+
+    let credential = match state
+        .security
+        .credentials
+        .iter()
+        .find(|cred| cred.api_key == api_key)
+        .cloned()
+    {
+        Some(cred) => cred,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"code":"unauthorized","message":"invalid api key"})),
+            )
+                .into_response();
+        }
+    };
+
+    let requested_tenant = headers
+        .get("x-tenant-id")
+        .and_then(|x| x.to_str().ok())
+        .unwrap_or(DEFAULT_TENANT)
+        .to_string();
+
+    if let Some(scope) = &credential.tenant_scope {
+        if scope != &requested_tenant {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    serde_json::json!({"code":"tenant_forbidden","message":"tenant scope denied"}),
+                ),
+            )
+                .into_response();
+        }
+    }
+
+    let method = request.method().clone();
+    if !role_allowed(&credential.role, &method) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"code":"rbac_forbidden","message":"insufficient role permission"})),
+        )
+            .into_response();
+    }
+
+    let rate_key = format!("{}:{}:{}", credential.key_id, requested_tenant, method);
+    {
+        let mut windows = state.rate_limiter.write().await;
+        let now = Instant::now();
+        let window = windows.entry(rate_key).or_insert(RateLimitWindow {
+            count: 0,
+            window_started_at: now,
+        });
+        if now.duration_since(window.window_started_at) >= Duration::from_secs(60) {
+            window.count = 0;
+            window.window_started_at = now;
+        }
+        if window.count >= state.security.rate_limit_per_minute {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"code":"rate_limit_exceeded","message":"rate limit exceeded"})),
+            )
+                .into_response();
+        }
+        window.count += 1;
+    }
+
+    let actor = AuthContext {
+        key_id: credential.key_id,
+        user_id: headers
+            .get("x-user-id")
+            .and_then(|x| x.to_str().ok())
+            .unwrap_or(&credential.user_id)
+            .to_string(),
+        tenant_id: requested_tenant,
+        role: credential.role,
+        kms_key_ref: credential.kms_key_ref,
+    };
+
+    request.extensions_mut().insert(actor);
+    next.run(request).await
+}
+
 async fn create_task(
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
     Json(req): Json<CreateTaskRequest>,
 ) -> Result<Json<CreateTaskResponse>, ApiError> {
     let params = req.params.unwrap_or_else(|| serde_json::json!({}));
@@ -274,6 +524,8 @@ async fn create_task(
 
     let task = TestTask {
         task_id: Uuid::new_v4(),
+        tenant_id: actor.tenant_id.clone(),
+        created_by: actor.user_id.clone(),
         task_name: req.task_name,
         user_goal: req.user_goal,
         scenario: plan.scenario.clone(),
@@ -303,6 +555,14 @@ async fn create_task(
     store.tasks.insert(task_id, task);
     store.tool_calls.insert(task_id, vec![]);
     store.snapshots.insert(task_id, vec![]);
+    append_audit_log(
+        &mut store,
+        &actor,
+        "task.create",
+        &format!("task/{}", task_id),
+        true,
+        serde_json::json!({}),
+    );
     persist_store(&store);
 
     Ok(Json(CreateTaskResponse {
@@ -318,6 +578,7 @@ async fn create_task(
 async fn update_task_data(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
     Json(req): Json<UpdateTaskDataRequest>,
 ) -> Result<Json<TestTask>, ApiError> {
     let mut store = state.store.write().await;
@@ -325,6 +586,7 @@ async fn update_task_data(
         code: "task_not_found",
         message: format!("task {} not found", task_id),
     })?;
+    ensure_tenant_access(&task.tenant_id, &actor)?;
 
     let merged = merge_json(task.params.clone(), req.params.clone());
     task.params = mask_sensitive_json(&merged);
@@ -344,29 +606,53 @@ async fn update_task_data(
     task.updated_at = Utc::now();
 
     let out = task.clone();
+    append_audit_log(
+        &mut store,
+        &actor,
+        "task.update_data",
+        &format!("task/{}", task_id),
+        true,
+        serde_json::json!({"missing_data": out.missing_data}),
+    );
     persist_store(&store);
     Ok(Json(out))
 }
 
-async fn list_tasks(State(state): State<AppState>) -> Json<Vec<TestTask>> {
-    Json(state.store.read().await.tasks.values().cloned().collect())
+async fn list_tasks(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
+) -> Json<Vec<TestTask>> {
+    Json(
+        state
+            .store
+            .read()
+            .await
+            .tasks
+            .values()
+            .filter(|t| t.tenant_id == actor.tenant_id)
+            .cloned()
+            .collect(),
+    )
 }
 
 async fn get_task(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
 ) -> Result<Json<TestTask>, ApiError> {
     let store = state.store.read().await;
     let task = store.tasks.get(&task_id).cloned().ok_or(ApiError {
         code: "task_not_found",
         message: format!("task {} not found", task_id),
     })?;
+    ensure_tenant_access(&task.tenant_id, &actor)?;
     Ok(Json(task))
 }
 
 async fn start_task(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     {
         let mut store = state.store.write().await;
@@ -374,6 +660,7 @@ async fn start_task(
             code: "task_not_found",
             message: format!("task {} not found", task_id),
         })?;
+        ensure_tenant_access(&task.tenant_id, &actor)?;
 
         if !task.missing_data.is_empty() {
             return Err(ApiError {
@@ -388,6 +675,14 @@ async fn start_task(
         store.reports.remove(&task_id);
         store.tool_calls.entry(task_id).or_default().clear();
         store.snapshots.entry(task_id).or_default().clear();
+        append_audit_log(
+            &mut store,
+            &actor,
+            "task.start",
+            &format!("task/{}", task_id),
+            true,
+            serde_json::json!({}),
+        );
         persist_store(&store);
     }
 
@@ -406,6 +701,7 @@ async fn start_task(
 async fn retry_task(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     {
         let mut store = state.store.write().await;
@@ -413,6 +709,7 @@ async fn retry_task(
             code: "task_not_found",
             message: format!("task {} not found", task_id),
         })?;
+        ensure_tenant_access(&task.tenant_id, &actor)?;
 
         if task.retries >= task.max_retries {
             return Err(ApiError {
@@ -426,6 +723,14 @@ async fn retry_task(
         task.step_logs.clear();
         task.updated_at = Utc::now();
         store.reports.remove(&task_id);
+        append_audit_log(
+            &mut store,
+            &actor,
+            "task.retry",
+            &format!("task/{}", task_id),
+            true,
+            serde_json::json!({"retry_count": task.retries}),
+        );
         persist_store(&store);
     }
 
@@ -444,14 +749,24 @@ async fn retry_task(
 async fn pause_task(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut store = state.store.write().await;
     let task = store.tasks.get_mut(&task_id).ok_or(ApiError {
         code: "task_not_found",
         message: format!("task {} not found", task_id),
     })?;
+    ensure_tenant_access(&task.tenant_id, &actor)?;
     task.status = TaskStatus::Paused;
     task.updated_at = Utc::now();
+    append_audit_log(
+        &mut store,
+        &actor,
+        "task.pause",
+        &format!("task/{}", task_id),
+        true,
+        serde_json::json!({}),
+    );
     persist_store(&store);
     Ok(Json(
         serde_json::json!({"task_id": task_id, "status": "paused"}),
@@ -461,6 +776,7 @@ async fn pause_task(
 async fn resume_task(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     {
         let mut store = state.store.write().await;
@@ -468,6 +784,7 @@ async fn resume_task(
             code: "task_not_found",
             message: format!("task {} not found", task_id),
         })?;
+        ensure_tenant_access(&task.tenant_id, &actor)?;
         if task.status != TaskStatus::Paused {
             return Err(ApiError {
                 code: "not_paused",
@@ -476,6 +793,14 @@ async fn resume_task(
         }
         task.status = TaskStatus::Running;
         task.updated_at = Utc::now();
+        append_audit_log(
+            &mut store,
+            &actor,
+            "task.resume",
+            &format!("task/{}", task_id),
+            true,
+            serde_json::json!({}),
+        );
         persist_store(&store);
     }
 
@@ -494,15 +819,25 @@ async fn resume_task(
 async fn terminate_task(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut store = state.store.write().await;
     let task = store.tasks.get_mut(&task_id).ok_or(ApiError {
         code: "task_not_found",
         message: format!("task {} not found", task_id),
     })?;
+    ensure_tenant_access(&task.tenant_id, &actor)?;
 
     task.status = TaskStatus::Terminated;
     task.updated_at = Utc::now();
+    append_audit_log(
+        &mut store,
+        &actor,
+        "task.terminate",
+        &format!("task/{}", task_id),
+        true,
+        serde_json::json!({}),
+    );
     persist_store(&store);
     Ok(Json(
         serde_json::json!({"task_id": task_id, "status": "terminated"}),
@@ -512,12 +847,14 @@ async fn terminate_task(
 async fn get_progress(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
 ) -> Result<Json<TaskProgress>, ApiError> {
     let store = state.store.read().await;
     let task = store.tasks.get(&task_id).ok_or(ApiError {
         code: "task_not_found",
         message: format!("task {} not found", task_id),
     })?;
+    ensure_tenant_access(&task.tenant_id, &actor)?;
 
     let done = task.step_logs.len();
     let total = task.planned_steps.len();
@@ -550,20 +887,28 @@ async fn get_progress(
 async fn get_logs(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
 ) -> Result<Json<Vec<StepLog>>, ApiError> {
     let store = state.store.read().await;
     let task = store.tasks.get(&task_id).ok_or(ApiError {
         code: "task_not_found",
         message: format!("task {} not found", task_id),
     })?;
+    ensure_tenant_access(&task.tenant_id, &actor)?;
     Ok(Json(task.step_logs.clone()))
 }
 
 async fn get_tool_calls(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
 ) -> Result<Json<Vec<ToolCallLog>>, ApiError> {
     let store = state.store.read().await;
+    let task = store.tasks.get(&task_id).ok_or(ApiError {
+        code: "task_not_found",
+        message: format!("task {} not found", task_id),
+    })?;
+    ensure_tenant_access(&task.tenant_id, &actor)?;
     Ok(Json(
         store.tool_calls.get(&task_id).cloned().unwrap_or_default(),
     ))
@@ -572,8 +917,14 @@ async fn get_tool_calls(
 async fn get_snapshots(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
 ) -> Result<Json<Vec<PageSnapshot>>, ApiError> {
     let store = state.store.read().await;
+    let task = store.tasks.get(&task_id).ok_or(ApiError {
+        code: "task_not_found",
+        message: format!("task {} not found", task_id),
+    })?;
+    ensure_tenant_access(&task.tenant_id, &actor)?;
     Ok(Json(
         store.snapshots.get(&task_id).cloned().unwrap_or_default(),
     ))
@@ -582,24 +933,28 @@ async fn get_snapshots(
 async fn get_report(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
 ) -> Result<Json<TestReport>, ApiError> {
     let store = state.store.read().await;
     let report = store.reports.get(&task_id).cloned().ok_or(ApiError {
         code: "report_not_ready",
         message: "report not generated".to_string(),
     })?;
+    ensure_tenant_access(&report.tenant_id, &actor)?;
     Ok(Json(report))
 }
 
 async fn get_bug_report(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.read().await;
     let report = store.reports.get(&task_id).ok_or(ApiError {
         code: "report_not_ready",
         message: "report not generated".to_string(),
     })?;
+    ensure_tenant_access(&report.tenant_id, &actor)?;
     Ok(Json(
         report
             .bug_report
@@ -612,12 +967,14 @@ async fn get_bug_report(
 async fn export_report_markdown(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
 ) -> Result<String, ApiError> {
     let store = state.store.read().await;
     let report = store.reports.get(&task_id).ok_or(ApiError {
         code: "report_not_ready",
         message: "report not generated".to_string(),
     })?;
+    ensure_tenant_access(&report.tenant_id, &actor)?;
 
     let mut md = format!(
         "# 测试报告\n\n- task_id: {}\n- result: {:?}\n- summary: {}\n- issue_summary: {}\n\n## 执行步骤\n",
@@ -640,6 +997,70 @@ async fn export_report_markdown(
     }
 
     Ok(md)
+}
+
+#[derive(Debug, Serialize)]
+struct SecurityContextResponse {
+    user_id: String,
+    tenant_id: String,
+    role: UserRole,
+    key_id: String,
+    kms_provider: String,
+    kms_key_ref: Option<String>,
+    rate_limit_per_minute: u32,
+}
+
+async fn get_security_context(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
+) -> Json<SecurityContextResponse> {
+    Json(SecurityContextResponse {
+        user_id: actor.user_id,
+        tenant_id: actor.tenant_id,
+        role: actor.role,
+        key_id: actor.key_id,
+        kms_provider: state.security.kms_provider.clone(),
+        kms_key_ref: actor.kms_key_ref,
+        rate_limit_per_minute: state.security.rate_limit_per_minute,
+    })
+}
+
+async fn get_audit_logs(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthContext>,
+) -> Result<Json<Vec<AuditLog>>, ApiError> {
+    let store = state.store.read().await;
+    let logs = store
+        .audit_logs
+        .iter()
+        .filter(|log| {
+            log.tenant_id == actor.tenant_id
+                || (actor.role == UserRole::Admin && actor.tenant_id == DEFAULT_TENANT)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(Json(logs))
+}
+
+fn append_audit_log(
+    store: &mut Store,
+    actor: &AuthContext,
+    action: &str,
+    resource: &str,
+    success: bool,
+    detail: serde_json::Value,
+) {
+    store.audit_logs.push(AuditLog {
+        id: Uuid::new_v4(),
+        tenant_id: actor.tenant_id.clone(),
+        user_id: actor.user_id.clone(),
+        role: actor.role.clone(),
+        action: action.to_string(),
+        resource: resource.to_string(),
+        success,
+        detail,
+        created_at: Utc::now(),
+    });
 }
 
 async fn run_task_pipeline(task_id: Uuid, state: AppState) -> Result<(), String> {
@@ -847,6 +1268,7 @@ async fn finalize_task(
         let report = TestReport {
             report_id: Uuid::new_v4(),
             task_id,
+            tenant_id: task.tenant_id.clone(),
             result: status.clone(),
             summary: if status == TaskStatus::Passed {
                 "测试通过，核心链路执行完成".to_string()
