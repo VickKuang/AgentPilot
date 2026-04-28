@@ -8,6 +8,9 @@ use std::{
 };
 
 use axum::{
+    extract::{Path as AxumPath, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::IntoResponse,
@@ -250,6 +253,9 @@ struct ApiError {
 }
 
 #[derive(Debug, Deserialize)]
+struct ExportReportQuery {
+    format: Option<String>,
+    template: Option<String>,
 struct StepLogQuery {
     step_order: Option<u32>,
     status: Option<String>,
@@ -812,34 +818,55 @@ async fn get_bug_report(
 async fn export_report_markdown(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
-) -> Result<String, ApiError> {
+    axum::extract::Query(query): axum::extract::Query<ExportReportQuery>,
+) -> Result<Response, ApiError> {
     let store = state.store.read().await;
     let report = store.reports.get(&task_id).ok_or(ApiError {
         code: "report_not_ready",
         message: "report not generated".to_string(),
     })?;
 
-    let mut md = format!(
-        "# 测试报告\n\n- task_id: {}\n- result: {:?}\n- summary: {}\n- issue_summary: {}\n\n## 执行步骤\n",
-        report.task_id, report.result, report.summary, report.issue_summary
-    );
+    let format = query.format.unwrap_or_else(|| "markdown".to_string());
+    let markdown = render_report_markdown(report, query.template.as_deref());
 
-    for step in &report.steps {
-        md.push_str(&format!(
-            "- [{}] {} | expected: {} | actual: {}\n",
-            step.status, step.step_name, step.expected_result, step.actual_result
-        ));
+    match format.as_str() {
+        "markdown" | "md" => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/markdown; charset=utf-8"),
+            );
+            Ok((headers, markdown).into_response())
+        }
+        "html" => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            Ok((headers, markdown_to_html(&markdown)).into_response())
+        }
+        "pdf" => {
+            let pdf_bytes = render_report_pdf(report, &markdown).map_err(|e| ApiError {
+                code: "pdf_export_failed",
+                message: e,
+            })?;
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/pdf"),
+            );
+            headers.insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"report.pdf\""),
+            );
+            Ok((headers, pdf_bytes).into_response())
+        }
+        _ => Err(ApiError {
+            code: "unsupported_format",
+            message: "format only supports: markdown|html|pdf".to_string(),
+        }),
     }
-
-    if let Some(bug) = &report.bug_report {
-        md.push_str("\n## Bug 报告\n");
-        md.push_str(&format!(
-            "- title: {}\n- severity: {}\n- reason: {}\n",
-            bug.bug_title, bug.severity, bug.possible_reason
-        ));
-    }
-
-    Ok(md)
 }
 
 async fn run_task_pipeline(task_id: Uuid, state: AppState) -> Result<(), String> {
@@ -958,12 +985,7 @@ async fn fail_task(
             .tasks
             .get(&task_id)
             .ok_or_else(|| "task not found".to_string())?;
-
-        let sev = if task.scenario == "login" || task.scenario == "error_prompt" {
-            "P1"
-        } else {
-            "P2"
-        };
+        let sev = evaluate_bug_severity(task, reason);
 
         (
             task.step_logs
@@ -994,6 +1016,115 @@ async fn fail_task(
     .await;
 
     Ok(())
+}
+
+fn evaluate_bug_severity(task: &TestTask, reason: &str) -> String {
+    let failed_steps = task
+        .step_logs
+        .iter()
+        .filter(|s| s.status == "failed")
+        .count();
+    let retried_steps = task.step_logs.iter().filter(|s| s.retry_count > 0).count();
+    let timed_out = reason.contains("超时");
+    let auth_scene = task.scenario == "login" || task.scenario == "error_prompt";
+
+    if timed_out || failed_steps >= 2 || (auth_scene && failed_steps >= 1) {
+        return "P1".to_string();
+    }
+    if retried_steps >= 2 || task.retries > 0 {
+        return "P2".to_string();
+    }
+    "P3".to_string()
+}
+
+fn render_report_markdown(report: &TestReport, template: Option<&str>) -> String {
+    let default_template = r#"# 测试报告
+
+- task_id: {{task_id}}
+- result: {{result}}
+- summary: {{summary}}
+- issue_summary: {{issue_summary}}
+
+## 执行步骤
+{{steps}}
+
+{{bug_section}}
+"#;
+
+    let steps = report
+        .steps
+        .iter()
+        .map(|step| {
+            format!(
+                "- [{}] {} | expected: {} | actual: {}",
+                step.status, step.step_name, step.expected_result, step.actual_result
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let bug_section = report.bug_report.as_ref().map_or_else(
+        || "## Bug 报告\n- 无".to_string(),
+        |bug| {
+            format!(
+                "## Bug 报告\n- title: {}\n- severity: {}\n- reason: {}",
+                bug.bug_title, bug.severity, bug.possible_reason
+            )
+        },
+    );
+
+    (template.unwrap_or(default_template))
+        .replace("{{task_id}}", &report.task_id.to_string())
+        .replace("{{result}}", &format!("{:?}", report.result))
+        .replace("{{summary}}", &report.summary)
+        .replace("{{issue_summary}}", &report.issue_summary)
+        .replace("{{steps}}", &steps)
+        .replace("{{bug_section}}", &bug_section)
+}
+
+fn markdown_to_html(markdown: &str) -> String {
+    let escaped = markdown
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\"><title>测试报告</title></head><body><pre>{}</pre></body></html>",
+        escaped
+    )
+}
+
+fn render_report_pdf(report: &TestReport, markdown: &str) -> Result<Vec<u8>, String> {
+    use printpdf::{BuiltinFont, Mm, PdfDocument};
+    use std::io::BufWriter;
+
+    let (doc, page, layer) = PdfDocument::new("AutoTest Report", Mm(210.0), Mm(297.0), "Layer 1");
+    let current_layer = doc.get_page(page).get_layer(layer);
+    let font = doc
+        .add_builtin_font(BuiltinFont::Helvetica)
+        .map_err(|e| format!("load pdf font failed: {}", e))?;
+
+    let mut lines = vec![
+        format!("AutoTest Report / task_id: {}", report.task_id),
+        format!("result: {:?}", report.result),
+        format!("summary: {}", report.summary),
+        "--------------------------".to_string(),
+    ];
+    lines.extend(markdown.lines().take(24).map(|x| x.to_string()));
+
+    let mut y = 285.0;
+    for line in lines {
+        if y < 10.0 {
+            break;
+        }
+        current_layer.use_text(line, 10.0, Mm(10.0), Mm(y), &font);
+        y -= 6.0;
+    }
+
+    let mut bytes = Vec::new();
+    let mut writer = BufWriter::new(&mut bytes);
+    doc.save(&mut writer)
+        .map_err(|e| format!("render pdf failed: {}", e))?;
+    Ok(bytes)
 }
 
 async fn append_step_log(
@@ -1855,6 +1986,48 @@ mod tests {
     }
 
     #[test]
+    fn severity_should_be_p1_for_timeout() {
+        let task = TestTask {
+            task_id: Uuid::new_v4(),
+            task_name: "t".to_string(),
+            user_goal: "g".to_string(),
+            scenario: "search".to_string(),
+            status: TaskStatus::Failed,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            params: serde_json::json!({}),
+            required_data: vec![],
+            missing_data: vec![],
+            planned_steps: vec![],
+            step_logs: vec![],
+            retries: 0,
+            max_retries: 2,
+            max_step_retries: 2,
+            step_timeout_ms: 1000,
+            global_timeout_ms: 1000,
+        };
+        assert_eq!(evaluate_bug_severity(&task, "超过全局超时"), "P1");
+    }
+
+    #[test]
+    fn markdown_template_should_apply() {
+        let report = TestReport {
+            report_id: Uuid::new_v4(),
+            task_id: Uuid::new_v4(),
+            result: TaskStatus::Passed,
+            summary: "ok".to_string(),
+            issue_summary: "none".to_string(),
+            execution_steps: vec![],
+            actual_result: "done".to_string(),
+            expected_result: "done".to_string(),
+            steps: vec![],
+            bug_report: None,
+            screenshots: vec![],
+            created_at: Utc::now(),
+        };
+        let rendered = render_report_markdown(&report, Some("任务={{task_id}} 结果={{result}}"));
+        assert!(rendered.contains("任务="));
+        assert!(rendered.contains("结果=Passed"));
     fn planner_step_should_include_verify_rules() {
         let p = planner_plan("测试登录流程", &serde_json::json!({}));
         assert!(!p.steps[0].verify_rules.is_empty());
