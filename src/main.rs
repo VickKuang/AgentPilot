@@ -8,6 +8,10 @@ use std::{
 };
 
 use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path as AxumPath, State,
+    },
     extract::{Path as AxumPath, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -317,6 +321,7 @@ async fn main() {
         .route("/api/v1/tasks/:task_id/resume", post(resume_task))
         .route("/api/v1/tasks/:task_id/terminate", post(terminate_task))
         .route("/api/v1/tasks/:task_id/progress", get(get_progress))
+        .route("/api/v1/tasks/:task_id/ws", get(task_ws))
         .route("/api/v1/tasks/:task_id/logs", get(get_logs))
         .route(
             "/api/v1/tasks/:task_id/logs/failures",
@@ -632,33 +637,62 @@ async fn get_progress(
         code: "task_not_found",
         message: format!("task {} not found", task_id),
     })?;
+    Ok(Json(build_progress(task_id, task)))
+}
 
-    let done = task.step_logs.len();
-    let total = task.planned_steps.len();
-    let success = task
-        .step_logs
-        .iter()
-        .filter(|s| s.status == "success")
-        .count();
-    let failed = task
-        .step_logs
-        .iter()
-        .filter(|s| s.status == "failed")
-        .count();
+async fn task_ws(
+    ws: WebSocketUpgrade,
+    AxumPath(task_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    if !state.store.read().await.tasks.contains_key(&task_id) {
+        return Err(ApiError {
+            code: "task_not_found",
+            message: format!("task {} not found", task_id),
+        });
+    }
 
-    Ok(Json(TaskProgress {
-        task_id,
-        status: task.status.clone(),
-        total_steps: total,
-        done_steps: done,
-        success_steps: success,
-        failed_steps: failed,
-        progress_percent: if total == 0 {
-            0
-        } else {
-            ((done as f32 / total as f32) * 100.0).round() as u8
-        },
-    }))
+    Ok(ws.on_upgrade(move |socket| task_ws_loop(socket, task_id, state)))
+}
+
+async fn task_ws_loop(mut socket: WebSocket, task_id: Uuid, state: AppState) {
+    loop {
+        let payload = {
+            let store = state.store.read().await;
+            let Some(task) = store.tasks.get(&task_id) else {
+                break;
+            };
+
+            serde_json::json!({
+                "task": task,
+                "logs": task.step_logs,
+                "tool_calls": store.tool_calls.get(&task_id).cloned().unwrap_or_default(),
+                "progress": build_progress(task_id, task),
+            })
+        };
+
+        if socket
+            .send(Message::Text(payload.to_string()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+
+        let status = {
+            let store = state.store.read().await;
+            store.tasks.get(&task_id).map(|t| t.status.clone())
+        };
+
+        if matches!(
+            status,
+            Some(TaskStatus::Passed | TaskStatus::Failed | TaskStatus::Terminated)
+        ) {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 async fn get_logs(
@@ -1926,6 +1960,33 @@ fn persist_store(store: &Store) {
     }
 }
 
+fn build_progress(task_id: Uuid, task: &TestTask) -> TaskProgress {
+    let done = task.step_logs.len();
+    let total = task.planned_steps.len();
+    let success = task
+        .step_logs
+        .iter()
+        .filter(|s| s.status == "success")
+        .count();
+    let failed = task
+        .step_logs
+        .iter()
+        .filter(|s| s.status == "failed")
+        .count();
+
+    TaskProgress {
+        task_id,
+        status: task.status.clone(),
+        total_steps: total,
+        done_steps: done,
+        success_steps: success,
+        failed_steps: failed,
+        progress_percent: if total == 0 {
+            0
+        } else {
+            ((done as f32 / total as f32) * 100.0).round() as u8
+        },
+    }
 fn parse_optional_datetime(
     raw: Option<&str>,
     field: &str,

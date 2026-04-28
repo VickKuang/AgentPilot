@@ -4,7 +4,13 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AutoTest Agent - 执行页</title>
-  <style>body{font-family:Arial;margin:30px;max-width:1000px} button{padding:8px 12px;margin-right:8px;margin-bottom:8px} pre{background:#f6f6f6;padding:10px;white-space:pre-wrap}</style>
+  <style>
+    body{font-family:Arial;margin:30px;max-width:1000px}
+    button{padding:8px 12px;margin-right:8px;margin-bottom:8px}
+    pre{background:#f6f6f6;padding:10px;white-space:pre-wrap}
+    .error{background:#fff0f0;color:#b42318;padding:10px;border:1px solid #f5c2c7;margin:10px 0;display:none}
+    .status{margin:10px 0;color:#175cd3}
+  </style>
 </head>
 <body>
   <h1>AutoTest Agent - 测试执行页</h1>
@@ -14,9 +20,11 @@
     <button onclick="pauseTask()">暂停</button>
     <button onclick="resumeTask()">恢复</button>
     <button onclick="terminateTask()">终止</button>
-    <button onclick="refresh()">刷新状态</button>
+    <button onclick="refresh()">手动刷新</button>
     <button onclick="gotoReport()">查看报告</button>
   </div>
+  <div class="status" id="ws_status">实时状态：连接中...</div>
+  <div id="error" class="error"></div>
   <h3>任务进度</h3>
   <pre id="progress"></pre>
   <h3>任务详情</h3>
@@ -28,23 +36,75 @@
 
   <script>
     const taskId = new URLSearchParams(location.search).get('task_id');
+    const errorBox = document.getElementById('error');
+    const wsStatus = document.getElementById('ws_status');
+    let ws = null;
+    let pollTimer = null;
+
+    function showError(message) {
+      errorBox.style.display = 'block';
+      errorBox.textContent = message;
+    }
+
+    function clearError() {
+      errorBox.style.display = 'none';
+      errorBox.textContent = '';
+    }
+
+    function getHeaders() {
+      return {
+        'X-User-Id': localStorage.getItem('user_id') || 'demo-user',
+        'X-Project-Id': localStorage.getItem('project_id') || 'demo-project'
+      };
+    }
+
+    function render(payload) {
+      if (!payload) return;
+      if (payload.task) document.getElementById('task').textContent = JSON.stringify(payload.task, null, 2);
+      if (payload.logs) document.getElementById('logs').textContent = JSON.stringify(payload.logs, null, 2);
+      if (payload.tool_calls) document.getElementById('tool_calls').textContent = JSON.stringify(payload.tool_calls, null, 2);
+      if (payload.progress) document.getElementById('progress').textContent = JSON.stringify(payload.progress, null, 2);
+    }
 
     async function post(path) {
-      await fetch(path, {method: 'POST'});
-      await refresh();
+      clearError();
+      try {
+        const res = await fetch(path, { method: 'POST', headers: getHeaders() });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.message || `请求失败(${res.status})`);
+        await refresh();
+      } catch (err) {
+        showError(err.message || '操作失败');
+      }
     }
 
     async function refresh() {
-      const [taskRes, logRes, callRes, pgRes] = await Promise.all([
-        fetch(`/api/v1/tasks/${taskId}`),
-        fetch(`/api/v1/tasks/${taskId}/logs`),
-        fetch(`/api/v1/tasks/${taskId}/tool-calls`),
-        fetch(`/api/v1/tasks/${taskId}/progress`),
-      ]);
-      document.getElementById('task').textContent = JSON.stringify(await taskRes.json(), null, 2);
-      document.getElementById('logs').textContent = JSON.stringify(await logRes.json(), null, 2);
-      document.getElementById('tool_calls').textContent = JSON.stringify(await callRes.json(), null, 2);
-      document.getElementById('progress').textContent = JSON.stringify(await pgRes.json(), null, 2);
+      clearError();
+      if (!taskId) {
+        showError('缺少 task_id，请从任务创建页进入');
+        return;
+      }
+      try {
+        const [taskRes, logRes, callRes, pgRes] = await Promise.all([
+          fetch(`/api/v1/tasks/${taskId}`, { headers: getHeaders() }),
+          fetch(`/api/v1/tasks/${taskId}/logs`, { headers: getHeaders() }),
+          fetch(`/api/v1/tasks/${taskId}/tool-calls`, { headers: getHeaders() }),
+          fetch(`/api/v1/tasks/${taskId}/progress`, { headers: getHeaders() }),
+        ]);
+
+        const [taskData, logData, callData, pgData] = await Promise.all([
+          taskRes.json(), logRes.json(), callRes.json(), pgRes.json()
+        ]);
+
+        if (!taskRes.ok) throw new Error(taskData.message || `任务查询失败(${taskRes.status})`);
+        if (!logRes.ok) throw new Error(logData.message || `日志查询失败(${logRes.status})`);
+        if (!callRes.ok) throw new Error(callData.message || `工具日志查询失败(${callRes.status})`);
+        if (!pgRes.ok) throw new Error(pgData.message || `进度查询失败(${pgRes.status})`);
+
+        render({ task: taskData, logs: logData, tool_calls: callData, progress: pgData });
+      } catch (err) {
+        showError(err.message || '刷新失败');
+      }
     }
 
     async function startTask(){ await post(`/api/v1/tasks/${taskId}/start`); }
@@ -57,8 +117,43 @@
       location.href = `/report.html?task_id=${taskId}`;
     }
 
+    function connectWebSocket() {
+      if (!taskId) {
+        showError('缺少 task_id，请从任务创建页进入');
+        return;
+      }
+
+      const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${protocol}://${location.host}/api/v1/tasks/${taskId}/ws`);
+
+      ws.onopen = () => {
+        wsStatus.textContent = '实时状态：WebSocket 已连接';
+        if (pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          render(JSON.parse(event.data));
+        } catch (_) {}
+      };
+
+      ws.onerror = () => {
+        wsStatus.textContent = '实时状态：WebSocket 异常，降级为轮询';
+      };
+
+      ws.onclose = () => {
+        wsStatus.textContent = '实时状态：WebSocket 已断开，使用轮询';
+        if (!pollTimer) {
+          pollTimer = setInterval(refresh, 1500);
+        }
+      };
+    }
+
     refresh();
-    setInterval(refresh, 1500);
+    connectWebSocket();
   </script>
 </body>
 </html>

@@ -4,11 +4,19 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AutoTest Agent - 报告页</title>
-  <style>body{font-family:Arial;margin:30px;max-width:1000px} button{padding:8px 12px;margin-right:8px} pre{background:#f6f6f6;padding:10px;white-space:pre-wrap}</style>
+  <style>
+    body{font-family:Arial;margin:30px;max-width:1000px}
+    button{padding:8px 12px;margin-right:8px}
+    pre{background:#f6f6f6;padding:10px;white-space:pre-wrap}
+    .error{background:#fff0f0;color:#b42318;padding:10px;border:1px solid #f5c2c7;margin:10px 0;display:none}
+  </style>
 </head>
 <body>
   <h1>AutoTest Agent - 测试报告页</h1>
   <button onclick="loadReport()">刷新报告</button>
+  <button onclick="exportMd()">导出 Markdown</button>
+  <div id="error" class="error"></div>
+  <h3>测试报告</h3>
   <button onclick="exportReport('markdown')">导出 Markdown</button>
   <button onclick="exportReport('html')">导出 HTML</button>
   <button onclick="exportReport('pdf')">导出 PDF</button>
@@ -21,20 +29,78 @@
 结论：{{result}}
 {{steps}}"></textarea>
   <pre id="report"></pre>
+  <h3>Bug 报告</h3>
   <pre id="bug"></pre>
+  <h3>Markdown 导出</h3>
   <pre id="export"></pre>
 
   <script>
     const taskId = new URLSearchParams(location.search).get('task_id');
-    async function loadReport() {
-      const [rep, bug] = await Promise.all([
-        fetch(`/api/v1/tasks/${taskId}/report`),
-        fetch(`/api/v1/tasks/${taskId}/bug-report`)
-      ]);
-      document.getElementById('report').textContent = JSON.stringify(await rep.json(), null, 2);
-      document.getElementById('bug').textContent = JSON.stringify(await bug.json(), null, 2);
+    const errorBox = document.getElementById('error');
+
+    function showError(message) {
+      errorBox.style.display = 'block';
+      errorBox.textContent = message;
     }
 
+    function clearError() {
+      errorBox.style.display = 'none';
+      errorBox.textContent = '';
+    }
+
+    function getHeaders() {
+      return {
+        'X-User-Id': localStorage.getItem('user_id') || 'demo-user',
+        'X-Project-Id': localStorage.getItem('project_id') || 'demo-project'
+      };
+    }
+
+    async function loadReport() {
+      clearError();
+      if (!taskId) {
+        showError('缺少 task_id，请从执行页进入');
+        return;
+      }
+
+      try {
+        const [rep, bug] = await Promise.all([
+          fetch(`/api/v1/tasks/${taskId}/report`, { headers: getHeaders() }),
+          fetch(`/api/v1/tasks/${taskId}/bug-report`, { headers: getHeaders() })
+        ]);
+
+        const [reportData, bugData] = await Promise.all([rep.json(), bug.json()]);
+        if (!rep.ok) throw new Error(reportData.message || `报告查询失败(${rep.status})`);
+        if (!bug.ok) throw new Error(bugData.message || `Bug报告查询失败(${bug.status})`);
+
+        document.getElementById('report').textContent = JSON.stringify(reportData, null, 2);
+        document.getElementById('bug').textContent = JSON.stringify(bugData, null, 2);
+      } catch (err) {
+        showError(err.message || '查询报告失败');
+      }
+    }
+
+    async function exportMd() {
+      clearError();
+      if (!taskId) {
+        showError('缺少 task_id，请从执行页进入');
+        return;
+      }
+
+      try {
+        const res = await fetch(`/api/v1/tasks/${taskId}/report/export`, { headers: getHeaders() });
+        const body = await res.text();
+        if (!res.ok) {
+          try {
+            const parsed = JSON.parse(body);
+            throw new Error(parsed.message || `导出失败(${res.status})`);
+          } catch (_) {
+            throw new Error(body || `导出失败(${res.status})`);
+          }
+        }
+        document.getElementById('export').textContent = body;
+      } catch (err) {
+        showError(err.message || '导出失败');
+      }
     async function exportReport(format) {
       const template = document.getElementById('template').value.trim();
       const query = new URLSearchParams({ format });

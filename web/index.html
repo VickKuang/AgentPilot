@@ -4,10 +4,20 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AutoTest Agent - 任务输入</title>
-  <style>body{font-family:Arial;margin:30px;max-width:900px} textarea,input{width:100%;padding:8px;margin:6px 0} button{padding:8px 12px} pre{background:#f6f6f6;padding:10px}</style>
+  <style>
+    body{font-family:Arial;margin:30px;max-width:900px}
+    textarea,input{width:100%;padding:8px;margin:6px 0;box-sizing:border-box}
+    button{padding:8px 12px;margin-right:8px}
+    pre{background:#f6f6f6;padding:10px;white-space:pre-wrap}
+    .error{background:#fff0f0;color:#b42318;padding:10px;border:1px solid #f5c2c7;margin:10px 0;display:none}
+  </style>
 </head>
 <body>
   <h1>AutoTest Agent - 测试任务输入页</h1>
+  <label>用户ID</label>
+  <input id="user_id" value="demo-user" />
+  <label>项目ID</label>
+  <input id="project_id" value="demo-project" />
   <label>任务名称</label>
   <input id="task_name" value="登录流程测试" />
   <label>测试目标</label>
@@ -16,34 +26,104 @@
   <textarea id="params" rows="8">{"username":"demo","password":"demo123"}</textarea>
   <button onclick="createTask()">创建任务</button>
   <button onclick="listTasks()">刷新任务列表</button>
+  <div id="error" class="error"></div>
   <pre id="output"></pre>
 
   <script>
     const output = document.getElementById('output');
+    const errorBox = document.getElementById('error');
+
+    loadContext();
+
+    function loadContext() {
+      const userId = localStorage.getItem('user_id');
+      const projectId = localStorage.getItem('project_id');
+      if (userId) document.getElementById('user_id').value = userId;
+      if (projectId) document.getElementById('project_id').value = projectId;
+    }
+
+    function saveContext() {
+      const userId = document.getElementById('user_id').value.trim();
+      const projectId = document.getElementById('project_id').value.trim();
+      localStorage.setItem('user_id', userId);
+      localStorage.setItem('project_id', projectId);
+      return { userId, projectId };
+    }
+
+    function showError(message) {
+      errorBox.style.display = 'block';
+      errorBox.textContent = message;
+    }
+
+    function clearError() {
+      errorBox.style.display = 'none';
+      errorBox.textContent = '';
+    }
+
+    async function apiFetch(url, options = {}) {
+      const { userId, projectId } = saveContext();
+      const headers = {
+        ...(options.headers || {}),
+        'X-User-Id': userId,
+        'X-Project-Id': projectId
+      };
+      const res = await fetch(url, { ...options, headers });
+      const rawText = await res.text();
+      let body = {};
+      try {
+        body = rawText ? JSON.parse(rawText) : {};
+      } catch (_) {
+        body = { message: rawText };
+      }
+
+      if (!res.ok) {
+        throw new Error(body.message || `请求失败(${res.status})`);
+      }
+      return body;
+    }
 
     async function createTask() {
-      const payload = {
-        task_name: document.getElementById('task_name').value,
-        user_goal: document.getElementById('user_goal').value,
-        params: JSON.parse(document.getElementById('params').value || '{}')
-      };
+      clearError();
+      try {
+        const taskName = document.getElementById('task_name').value.trim();
+        const userGoal = document.getElementById('user_goal').value.trim();
+        const userId = document.getElementById('user_id').value.trim();
+        const projectId = document.getElementById('project_id').value.trim();
 
-      const res = await fetch('/api/v1/tasks', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(payload)
-      });
-      const data = await res.json();
-      output.textContent = JSON.stringify(data, null, 2);
+        if (!userId || !projectId) throw new Error('用户ID和项目ID不能为空');
+        if (!taskName) throw new Error('任务名称不能为空');
+        if (!userGoal) throw new Error('测试目标不能为空');
 
-      if (data.task_id) {
-        location.href = `/task.html?task_id=${data.task_id}`;
+        let params = {};
+        try {
+          params = JSON.parse(document.getElementById('params').value || '{}');
+        } catch (_) {
+          throw new Error('参数(JSON)格式错误，请检查后重试');
+        }
+
+        const data = await apiFetch('/api/v1/tasks', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ task_name: taskName, user_goal: userGoal, params })
+        });
+
+        output.textContent = JSON.stringify(data, null, 2);
+        if (data.task_id) {
+          location.href = `/task.html?task_id=${data.task_id}`;
+        }
+      } catch (err) {
+        showError(err.message || '创建任务失败');
       }
     }
 
     async function listTasks() {
-      const res = await fetch('/api/v1/tasks');
-      output.textContent = JSON.stringify(await res.json(), null, 2);
+      clearError();
+      try {
+        const data = await apiFetch('/api/v1/tasks');
+        output.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        showError(err.message || '查询任务失败');
+      }
     }
   </script>
 </body>
