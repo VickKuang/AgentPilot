@@ -160,14 +160,14 @@
 
 ## 9. 与 README Roadmap 对齐情况
 
-**Roadmap 完成度：0/5（0%）**
+**Roadmap 完成度：5/5（100%）**
 
-README 中 5 项“下一步”目前均未真正落地：
-1. 真实驱动替换 mock（未实现）。
-2. PostgreSQL 替代 store.json（未实现）。
-3. 鉴权与多租户（未实现）。
-4. WebSocket 实时推送（未实现）。
-5. Jira/飞书/企微自动提单（未实现）。
+README 中 5 项“下一步”已全部落地：
+1. 真实驱动替换 mock（已实现：支持 `DRIVER_BASE_URL` 对接 `/observe` 与 `/action`）。
+2. PostgreSQL 替代 store.json（已实现：配置 `DATABASE_URL` 后使用 PostgreSQL `app_store` 表存储）。
+3. 鉴权与多租户（已实现：`x-api-key` + `x-tenant-id`，并按租户过滤任务访问）。
+4. WebSocket 实时推送（已实现：`/api/v1/tasks/:task_id/ws` 订阅任务状态/步骤事件）。
+5. Jira/飞书/企微自动提单（已实现：任务失败后自动向配置的 webhook 推送报告摘要）。
 
 ---
 
