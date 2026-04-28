@@ -1,0 +1,8 @@
+{
+  "required_phrases": [
+    "# 测试报告",
+    "## 执行步骤",
+    "- result: Passed",
+    "summary"
+  ]
+}

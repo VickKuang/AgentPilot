@@ -66,7 +66,7 @@ cargo run
 
 - `web/index.html`：测试任务输入页（自然语言 + JSON 参数）
 - `web/task.html`：执行控制台（开始/重试/暂停/恢复/终止 + 进度）
-- `web/report.html`：报告页（测试报告 / Bug 报告 / Markdown 导出）
+- `web/report.html`：报告页（测试报告 / Bug 报告 / Markdown/HTML/PDF 导出 + 模板）
 
 ---
 
@@ -95,7 +95,7 @@ cargo run
 - `GET /api/v1/tasks/:task_id/snapshots`
 - `GET /api/v1/tasks/:task_id/report`
 - `GET /api/v1/tasks/:task_id/bug-report`
-- `GET /api/v1/tasks/:task_id/report/export`
+- `GET /api/v1/tasks/:task_id/report/export?format=markdown|html|pdf&template=<tpl>`
 
 ---
 
