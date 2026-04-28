@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AutoTest Agent - 任务输入</title>
+  <style>body{font-family:Arial;margin:30px;max-width:900px} textarea,input{width:100%;padding:8px;margin:6px 0} button{padding:8px 12px} pre{background:#f6f6f6;padding:10px}</style>
+</head>
+<body>
+  <h1>AutoTest Agent - 测试任务输入页</h1>
+  <label>任务名称</label>
+  <input id="task_name" value="登录流程测试" />
+  <label>测试目标</label>
+  <textarea id="user_goal" rows="3">测试登录流程是否正常</textarea>
+  <label>参数(JSON)</label>
+  <textarea id="params" rows="8">{"username":"demo","password":"demo123"}</textarea>
+  <button onclick="createTask()">创建任务</button>
+  <button onclick="listTasks()">刷新任务列表</button>
+  <pre id="output"></pre>
+
+  <script>
+    const output = document.getElementById('output');
+
+    async function createTask() {
+      const payload = {
+        task_name: document.getElementById('task_name').value,
+        user_goal: document.getElementById('user_goal').value,
+        params: JSON.parse(document.getElementById('params').value || '{}')
+      };
+
+      const res = await fetch('/api/v1/tasks', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      output.textContent = JSON.stringify(data, null, 2);
+
+      if (data.task_id) {
+        location.href = `/task.html?task_id=${data.task_id}`;
+      }
+    }
+
+    async function listTasks() {
+      const res = await fetch('/api/v1/tasks');
+      output.textContent = JSON.stringify(await res.json(), null, 2);
+    }
+  </script>
+</body>
+</html>

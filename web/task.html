@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AutoTest Agent - 执行页</title>
+  <style>body{font-family:Arial;margin:30px;max-width:1000px} button{padding:8px 12px;margin-right:8px;margin-bottom:8px} pre{background:#f6f6f6;padding:10px;white-space:pre-wrap}</style>
+</head>
+<body>
+  <h1>AutoTest Agent - 测试执行页</h1>
+  <div>
+    <button onclick="startTask()">开始执行</button>
+    <button onclick="retryTask()">重试</button>
+    <button onclick="pauseTask()">暂停</button>
+    <button onclick="resumeTask()">恢复</button>
+    <button onclick="terminateTask()">终止</button>
+    <button onclick="refresh()">刷新状态</button>
+    <button onclick="gotoReport()">查看报告</button>
+  </div>
+  <h3>任务进度</h3>
+  <pre id="progress"></pre>
+  <h3>任务详情</h3>
+  <pre id="task"></pre>
+  <h3>步骤日志</h3>
+  <pre id="logs"></pre>
+  <h3>工具调用日志</h3>
+  <pre id="tool_calls"></pre>
+
+  <script>
+    const taskId = new URLSearchParams(location.search).get('task_id');
+
+    async function post(path) {
+      await fetch(path, {method: 'POST'});
+      await refresh();
+    }
+
+    async function refresh() {
+      const [taskRes, logRes, callRes, pgRes] = await Promise.all([
+        fetch(`/api/v1/tasks/${taskId}`),
+        fetch(`/api/v1/tasks/${taskId}/logs`),
+        fetch(`/api/v1/tasks/${taskId}/tool-calls`),
+        fetch(`/api/v1/tasks/${taskId}/progress`),
+      ]);
+      document.getElementById('task').textContent = JSON.stringify(await taskRes.json(), null, 2);
+      document.getElementById('logs').textContent = JSON.stringify(await logRes.json(), null, 2);
+      document.getElementById('tool_calls').textContent = JSON.stringify(await callRes.json(), null, 2);
+      document.getElementById('progress').textContent = JSON.stringify(await pgRes.json(), null, 2);
+    }
+
+    async function startTask(){ await post(`/api/v1/tasks/${taskId}/start`); }
+    async function retryTask(){ await post(`/api/v1/tasks/${taskId}/retry`); }
+    async function pauseTask(){ await post(`/api/v1/tasks/${taskId}/pause`); }
+    async function resumeTask(){ await post(`/api/v1/tasks/${taskId}/resume`); }
+    async function terminateTask(){ await post(`/api/v1/tasks/${taskId}/terminate`); }
+
+    function gotoReport() {
+      location.href = `/report.html?task_id=${taskId}`;
+    }
+
+    refresh();
+    setInterval(refresh, 1500);
+  </script>
+</body>
+</html>

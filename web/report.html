@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AutoTest Agent - 报告页</title>
+  <style>body{font-family:Arial;margin:30px;max-width:1000px} button{padding:8px 12px;margin-right:8px} pre{background:#f6f6f6;padding:10px;white-space:pre-wrap}</style>
+</head>
+<body>
+  <h1>AutoTest Agent - 测试报告页</h1>
+  <button onclick="loadReport()">刷新报告</button>
+  <button onclick="exportMd()">导出 Markdown</button>
+  <pre id="report"></pre>
+  <pre id="bug"></pre>
+  <pre id="export"></pre>
+
+  <script>
+    const taskId = new URLSearchParams(location.search).get('task_id');
+    async function loadReport() {
+      const [rep, bug] = await Promise.all([
+        fetch(`/api/v1/tasks/${taskId}/report`),
+        fetch(`/api/v1/tasks/${taskId}/bug-report`)
+      ]);
+      document.getElementById('report').textContent = JSON.stringify(await rep.json(), null, 2);
+      document.getElementById('bug').textContent = JSON.stringify(await bug.json(), null, 2);
+    }
+
+    async function exportMd() {
+      const res = await fetch(`/api/v1/tasks/${taskId}/report/export`);
+      document.getElementById('export').textContent = await res.text();
+    }
+
+    loadReport();
+  </script>
+</body>
+</html>
