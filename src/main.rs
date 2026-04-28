@@ -8,7 +8,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, patch, post},
@@ -209,6 +209,24 @@ struct TaskProgress {
     progress_percent: u8,
 }
 
+#[derive(Debug, Deserialize)]
+struct ListTasksQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
+    status: Option<String>,
+    sort_by: Option<String>,
+    sort_order: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListTasksResponse {
+    items: Vec<TestTask>,
+    page: usize,
+    page_size: usize,
+    total: usize,
+    total_pages: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct ApiError {
     code: &'static str,
@@ -336,11 +354,12 @@ async fn update_task_data(
         .cloned()
         .collect();
 
-    task.status = if task.missing_data.is_empty() {
+    let new_status = if task.missing_data.is_empty() {
         TaskStatus::Pending
     } else {
         TaskStatus::Blocked
     };
+    transition_task_status(task, new_status, "update_task_data")?;
     task.updated_at = Utc::now();
 
     let out = task.clone();
@@ -348,8 +367,45 @@ async fn update_task_data(
     Ok(Json(out))
 }
 
-async fn list_tasks(State(state): State<AppState>) -> Json<Vec<TestTask>> {
-    Json(state.store.read().await.tasks.values().cloned().collect())
+async fn list_tasks(
+    State(state): State<AppState>,
+    Query(query): Query<ListTasksQuery>,
+) -> Result<Json<ListTasksResponse>, ApiError> {
+    let store = state.store.read().await;
+    let mut tasks = store.tasks.values().cloned().collect::<Vec<_>>();
+
+    if let Some(raw_status) = query.status {
+        let status = parse_task_status(&raw_status)?;
+        tasks.retain(|t| t.status == status);
+    }
+
+    let sort_by = query.sort_by.unwrap_or_else(|| "created_at".to_string());
+    let sort_order = query.sort_order.unwrap_or_else(|| "desc".to_string());
+    sort_tasks(&mut tasks, &sort_by, &sort_order)?;
+
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let page = query.page.unwrap_or(1).max(1);
+    let total = tasks.len();
+    let total_pages = if total == 0 {
+        0
+    } else {
+        total.div_ceil(page_size)
+    };
+    let start = (page - 1) * page_size;
+    let items = if start >= total {
+        vec![]
+    } else {
+        let end = (start + page_size).min(total);
+        tasks[start..end].to_vec()
+    };
+
+    Ok(Json(ListTasksResponse {
+        items,
+        page,
+        page_size,
+        total,
+        total_pages,
+    }))
 }
 
 async fn get_task(
@@ -382,7 +438,7 @@ async fn start_task(
             });
         }
 
-        task.status = TaskStatus::Running;
+        transition_task_status(task, TaskStatus::Running, "start_task")?;
         task.updated_at = Utc::now();
         task.step_logs.clear();
         store.reports.remove(&task_id);
@@ -422,7 +478,7 @@ async fn retry_task(
         }
 
         task.retries += 1;
-        task.status = TaskStatus::Running;
+        transition_task_status(task, TaskStatus::Running, "retry_task")?;
         task.step_logs.clear();
         task.updated_at = Utc::now();
         store.reports.remove(&task_id);
@@ -450,7 +506,7 @@ async fn pause_task(
         code: "task_not_found",
         message: format!("task {} not found", task_id),
     })?;
-    task.status = TaskStatus::Paused;
+    transition_task_status(task, TaskStatus::Paused, "pause_task")?;
     task.updated_at = Utc::now();
     persist_store(&store);
     Ok(Json(
@@ -468,13 +524,7 @@ async fn resume_task(
             code: "task_not_found",
             message: format!("task {} not found", task_id),
         })?;
-        if task.status != TaskStatus::Paused {
-            return Err(ApiError {
-                code: "not_paused",
-                message: "task is not paused".to_string(),
-            });
-        }
-        task.status = TaskStatus::Running;
+        transition_task_status(task, TaskStatus::Running, "resume_task")?;
         task.updated_at = Utc::now();
         persist_store(&store);
     }
@@ -501,7 +551,7 @@ async fn terminate_task(
         message: format!("task {} not found", task_id),
     })?;
 
-    task.status = TaskStatus::Terminated;
+    transition_task_status(task, TaskStatus::Terminated, "terminate_task")?;
     task.updated_at = Utc::now();
     persist_store(&store);
     Ok(Json(
@@ -835,7 +885,13 @@ async fn finalize_task(
             return;
         }
 
-        task.status = status.clone();
+        if let Err(err) = transition_task_status(task, status.clone(), "finalize_task") {
+            error!(
+                "invalid finalize transition for task {}: {}",
+                task_id, err.message
+            );
+            return;
+        }
         task.updated_at = Utc::now();
 
         let screenshots = task
@@ -1299,6 +1355,91 @@ fn merge_json(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
     }
 }
 
+fn transition_task_status(
+    task: &mut TestTask,
+    target: TaskStatus,
+    action: &'static str,
+) -> Result<(), ApiError> {
+    if can_transition(&task.status, &target) {
+        task.status = target;
+        return Ok(());
+    }
+
+    Err(ApiError {
+        code: "invalid_status_transition",
+        message: format!(
+            "非法状态迁移: {:?} -> {:?} (action={})",
+            task.status, target, action
+        ),
+    })
+}
+
+fn can_transition(from: &TaskStatus, to: &TaskStatus) -> bool {
+    if from == to {
+        return true;
+    }
+
+    matches!(
+        (from, to),
+        (TaskStatus::Blocked, TaskStatus::Pending)
+            | (TaskStatus::Pending, TaskStatus::Blocked)
+            | (TaskStatus::Pending, TaskStatus::Running)
+            | (TaskStatus::Running, TaskStatus::Paused)
+            | (TaskStatus::Paused, TaskStatus::Running)
+            | (TaskStatus::Running, TaskStatus::Passed)
+            | (TaskStatus::Running, TaskStatus::Failed)
+            | (TaskStatus::Failed, TaskStatus::Running)
+            | (TaskStatus::Passed, TaskStatus::Running)
+            | (TaskStatus::Pending, TaskStatus::Terminated)
+            | (TaskStatus::Running, TaskStatus::Terminated)
+            | (TaskStatus::Paused, TaskStatus::Terminated)
+            | (TaskStatus::Blocked, TaskStatus::Terminated)
+            | (TaskStatus::Failed, TaskStatus::Terminated)
+    )
+}
+
+fn parse_task_status(value: &str) -> Result<TaskStatus, ApiError> {
+    match value {
+        "pending" => Ok(TaskStatus::Pending),
+        "running" => Ok(TaskStatus::Running),
+        "paused" => Ok(TaskStatus::Paused),
+        "passed" => Ok(TaskStatus::Passed),
+        "failed" => Ok(TaskStatus::Failed),
+        "blocked" => Ok(TaskStatus::Blocked),
+        "terminated" => Ok(TaskStatus::Terminated),
+        _ => Err(ApiError {
+            code: "invalid_status_filter",
+            message: format!("unsupported status filter: {}", value),
+        }),
+    }
+}
+
+fn sort_tasks(tasks: &mut [TestTask], sort_by: &str, sort_order: &str) -> Result<(), ApiError> {
+    match sort_by {
+        "created_at" => tasks.sort_by_key(|t| t.created_at),
+        "updated_at" => tasks.sort_by_key(|t| t.updated_at),
+        _ => {
+            return Err(ApiError {
+                code: "invalid_sort_by",
+                message: format!("unsupported sort_by: {}", sort_by),
+            });
+        }
+    }
+
+    match sort_order {
+        "asc" => {}
+        "desc" => tasks.reverse(),
+        _ => {
+            return Err(ApiError {
+                code: "invalid_sort_order",
+                message: format!("unsupported sort_order: {}", sort_order),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn persist_store(store: &Store) {
     if let Err(err) = store.save() {
         error!("persist store failed: {}", err);
@@ -1331,5 +1472,63 @@ mod tests {
         let raw = serde_json::json!({"username":"u","password":"abc"});
         let masked = mask_sensitive_json(&raw);
         assert_eq!(masked.get("password").unwrap(), "***");
+    }
+
+    #[test]
+    fn status_transition_should_be_checked() {
+        assert!(can_transition(&TaskStatus::Pending, &TaskStatus::Running));
+        assert!(can_transition(&TaskStatus::Running, &TaskStatus::Passed));
+        assert!(!can_transition(&TaskStatus::Passed, &TaskStatus::Paused));
+    }
+
+    #[test]
+    fn sort_tasks_should_support_created_at() {
+        let now = Utc::now();
+        let old = now - chrono::Duration::seconds(10);
+        let mut tasks = vec![
+            TestTask {
+                task_id: Uuid::new_v4(),
+                task_name: "b".to_string(),
+                user_goal: "g".to_string(),
+                scenario: "search".to_string(),
+                status: TaskStatus::Pending,
+                created_at: now,
+                updated_at: now,
+                params: serde_json::json!({}),
+                required_data: vec![],
+                missing_data: vec![],
+                planned_steps: vec![],
+                step_logs: vec![],
+                retries: 0,
+                max_retries: 2,
+                max_step_retries: 2,
+                step_timeout_ms: 1000,
+                global_timeout_ms: 1000,
+            },
+            TestTask {
+                task_id: Uuid::new_v4(),
+                task_name: "a".to_string(),
+                user_goal: "g".to_string(),
+                scenario: "search".to_string(),
+                status: TaskStatus::Pending,
+                created_at: old,
+                updated_at: old,
+                params: serde_json::json!({}),
+                required_data: vec![],
+                missing_data: vec![],
+                planned_steps: vec![],
+                step_logs: vec![],
+                retries: 0,
+                max_retries: 2,
+                max_step_retries: 2,
+                step_timeout_ms: 1000,
+                global_timeout_ms: 1000,
+            },
+        ];
+
+        sort_tasks(&mut tasks, "created_at", "asc").unwrap();
+        assert_eq!(tasks[0].task_name, "a");
+        sort_tasks(&mut tasks, "created_at", "desc").unwrap();
+        assert_eq!(tasks[0].task_name, "b");
     }
 }
