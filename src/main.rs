@@ -23,6 +23,11 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::{
+    postgres::{PgPool, PgPoolOptions},
+    types::Json,
+    Row,
+};
 use tokio::sync::RwLock;
 use tower_http::services::ServeDir;
 use tracing::{error, info};
@@ -33,6 +38,7 @@ const STORE_FILE: &str = "data/store.json";
 #[derive(Clone)]
 struct AppState {
     store: Arc<RwLock<Store>>,
+    persistence: PersistenceBackend,
 }
 
 #[derive(Default, Serialize, Deserialize, Clone)]
@@ -61,6 +67,144 @@ impl Store {
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| format!("serialize store failed: {}", e))?;
         fs::write(STORE_FILE, content).map_err(|e| format!("write store failed: {}", e))
+    }
+}
+
+#[derive(Clone)]
+enum PersistenceBackend {
+    Json,
+    Postgres(PostgresPersistence),
+}
+
+#[derive(Clone)]
+struct PostgresPersistence {
+    pool: PgPool,
+    version: Arc<RwLock<i64>>,
+}
+
+impl PersistenceBackend {
+    async fn from_env() -> Result<(Self, Store), String> {
+        let database_url = std::env::var("DATABASE_URL").ok();
+        if let Some(url) = database_url {
+            let (pg, store) = PostgresPersistence::connect(&url).await?;
+            info!("using PostgreSQL persistence");
+            return Ok((Self::Postgres(pg), store));
+        }
+
+        info!("using local JSON persistence");
+        Ok((Self::Json, Store::load()))
+    }
+
+    async fn save_store(&self, store: &Store) -> Result<(), String> {
+        match self {
+            Self::Json => store.save(),
+            Self::Postgres(pg) => pg.save(store).await,
+        }
+    }
+}
+
+impl PostgresPersistence {
+    async fn connect(database_url: &str) -> Result<(Self, Store), String> {
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(database_url)
+            .await
+            .map_err(|e| format!("connect postgres failed: {}", e))?;
+
+        sqlx::query(
+            r#"
+            create table if not exists app_store_state (
+              id smallint primary key check (id = 1),
+              data jsonb not null,
+              version bigint not null default 0,
+              created_at timestamptz not null default now(),
+              updated_at timestamptz not null default now()
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("create app_store_state failed: {}", e))?;
+
+        let row = sqlx::query("select data, version from app_store_state where id = 1")
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| format!("query app_store_state failed: {}", e))?;
+
+        if let Some(row) = row {
+            let Json(data): Json<serde_json::Value> = row.get("data");
+            let version: i64 = row.get("version");
+            let store = serde_json::from_value::<Store>(data).unwrap_or_default();
+            Ok((
+                Self {
+                    pool,
+                    version: Arc::new(RwLock::new(version)),
+                },
+                store,
+            ))
+        } else {
+            let store = Store::default();
+            let data = serde_json::to_value(&store)
+                .map_err(|e| format!("serialize default store failed: {}", e))?;
+            sqlx::query("insert into app_store_state(id, data, version) values (1, $1, 0)")
+                .bind(Json(data))
+                .execute(&pool)
+                .await
+                .map_err(|e| format!("init app_store_state failed: {}", e))?;
+
+            Ok((
+                Self {
+                    pool,
+                    version: Arc::new(RwLock::new(0)),
+                },
+                store,
+            ))
+        }
+    }
+
+    async fn save(&self, store: &Store) -> Result<(), String> {
+        let data =
+            serde_json::to_value(store).map_err(|e| format!("serialize store failed: {}", e))?;
+
+        for _ in 0..3 {
+            let expected = *self.version.read().await;
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| format!("begin tx failed: {}", e))?;
+
+            let affected = sqlx::query(
+                "update app_store_state set data = $1, version = version + 1, updated_at = now() where id = 1 and version = $2",
+            )
+            .bind(Json(data.clone()))
+            .bind(expected)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("update app_store_state failed: {}", e))?
+            .rows_affected();
+
+            if affected == 1 {
+                tx.commit()
+                    .await
+                    .map_err(|e| format!("commit tx failed: {}", e))?;
+                *self.version.write().await = expected + 1;
+                return Ok(());
+            }
+
+            tx.rollback()
+                .await
+                .map_err(|e| format!("rollback tx failed: {}", e))?;
+
+            let latest = sqlx::query("select version from app_store_state where id = 1")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| format!("refresh version failed: {}", e))?;
+            let latest_version: i64 = latest.get("version");
+            *self.version.write().await = latest_version;
+        }
+
+        Err("save store failed after conflict retries".to_string())
     }
 }
 
@@ -306,8 +450,14 @@ async fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    let (persistence, initial_store) = PersistenceBackend::from_env().await.unwrap_or_else(|err| {
+        error!("init persistence failed, fallback to JSON: {}", err);
+        (PersistenceBackend::Json, Store::load())
+    });
+
     let state = AppState {
-        store: Arc::new(RwLock::new(Store::load())),
+        store: Arc::new(RwLock::new(initial_store)),
+        persistence,
     };
 
     let app = Router::new()
@@ -388,7 +538,7 @@ async fn create_task(
     store.tasks.insert(task_id, task);
     store.tool_calls.insert(task_id, vec![]);
     store.snapshots.insert(task_id, vec![]);
-    persist_store(&store);
+    persist_store(&state, &store).await;
 
     Ok(Json(CreateTaskResponse {
         task_id,
@@ -430,7 +580,7 @@ async fn update_task_data(
     task.updated_at = Utc::now();
 
     let out = task.clone();
-    persist_store(&store);
+    persist_store(&state, &store).await;
     Ok(Json(out))
 }
 
@@ -512,7 +662,7 @@ async fn start_task(
         store.reports.remove(&task_id);
         store.tool_calls.entry(task_id).or_default().clear();
         store.snapshots.entry(task_id).or_default().clear();
-        persist_store(&store);
+        persist_store(&state, &store).await;
     }
 
     let cloned = state.clone();
@@ -551,7 +701,7 @@ async fn retry_task(
         task.next_step_order = 1;
         task.updated_at = Utc::now();
         store.reports.remove(&task_id);
-        persist_store(&store);
+        persist_store(&state, &store).await;
     }
 
     let cloned = state.clone();
@@ -577,7 +727,7 @@ async fn pause_task(
     })?;
     transition_task_status(task, TaskStatus::Paused, "pause_task")?;
     task.updated_at = Utc::now();
-    persist_store(&store);
+    persist_store(&state, &store).await;
     Ok(Json(
         serde_json::json!({"task_id": task_id, "status": "paused"}),
     ))
@@ -595,7 +745,7 @@ async fn resume_task(
         })?;
         transition_task_status(task, TaskStatus::Running, "resume_task")?;
         task.updated_at = Utc::now();
-        persist_store(&store);
+        persist_store(&state, &store).await;
     }
 
     let cloned = state.clone();
@@ -622,7 +772,7 @@ async fn terminate_task(
 
     transition_task_status(task, TaskStatus::Terminated, "terminate_task")?;
     task.updated_at = Utc::now();
-    persist_store(&store);
+    persist_store(&state, &store).await;
     Ok(Json(
         serde_json::json!({"task_id": task_id, "status": "terminated"}),
     ))
@@ -1193,7 +1343,7 @@ async fn append_step_log(
         task.step_logs.push(log);
         task.updated_at = Utc::now();
     }
-    persist_store(&store);
+    persist_store(&state, &store).await;
 }
 
 async fn mark_step_success(task_id: Uuid, step_order: u32, state: AppState) {
@@ -1263,7 +1413,7 @@ async fn finalize_task(
         };
 
         store.reports.insert(task_id, report);
-        persist_store(&store);
+        persist_store(&state, &store).await;
     }
 }
 
@@ -1639,7 +1789,7 @@ async fn observer_observe(
 
     let mut store = state.store.write().await;
     store.snapshots.entry(task_id).or_default().push(snapshot);
-    persist_store(&store);
+    persist_store(&state, &store).await;
 
     ObserveResult {
         current_page,
@@ -1733,7 +1883,7 @@ async fn execute_action(
 
     let mut store = state.store.write().await;
     store.tool_calls.entry(task_id).or_default().push(log);
-    persist_store(&store);
+    persist_store(&state, &store).await;
 
     ActionResult {
         success: true,
@@ -1869,6 +2019,8 @@ fn merge_json(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
     }
 }
 
+async fn persist_store(state: &AppState, store: &Store) {
+    if let Err(err) = state.persistence.save_store(store).await {
 fn transition_task_status(
     task: &mut TestTask,
     target: TaskStatus,
