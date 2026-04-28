@@ -99,6 +99,8 @@ struct TestTask {
     max_step_retries: u8,
     step_timeout_ms: u64,
     global_timeout_ms: u64,
+    #[serde(default = "default_next_step_order")]
+    next_step_order: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +110,20 @@ struct PlannedStep {
     action_type: ActionType,
     action_params: serde_json::Value,
     expected_result: String,
+    #[serde(default)]
+    verify_rules: Vec<VerifyRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum VerifyRule {
+    ElementExists { name: String },
+    TextContains { value: String },
+    CurrentPageIs { value: String },
+}
+
+fn default_next_step_order() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +367,7 @@ async fn create_task(
         max_step_retries: 2,
         step_timeout_ms: 4_000,
         global_timeout_ms: 45_000,
+        next_step_order: 1,
     };
 
     let task_id = task.task_id;
@@ -480,6 +497,7 @@ async fn start_task(
         transition_task_status(task, TaskStatus::Running, "start_task")?;
         task.updated_at = Utc::now();
         task.step_logs.clear();
+        task.next_step_order = 1;
         store.reports.remove(&task_id);
         store.tool_calls.entry(task_id).or_default().clear();
         store.snapshots.entry(task_id).or_default().clear();
@@ -519,6 +537,7 @@ async fn retry_task(
         task.retries += 1;
         transition_task_status(task, TaskStatus::Running, "retry_task")?;
         task.step_logs.clear();
+        task.next_step_order = 1;
         task.updated_at = Utc::now();
         store.reports.remove(&task_id);
         persist_store(&store);
@@ -834,7 +853,14 @@ async fn run_task_pipeline(task_id: Uuid, state: AppState) -> Result<(), String>
     };
 
     let started = Instant::now();
-    for step in task_snapshot.planned_steps.clone() {
+    let pending_steps = task_snapshot
+        .planned_steps
+        .clone()
+        .into_iter()
+        .filter(|s| s.step_order >= task_snapshot.next_step_order)
+        .collect::<Vec<_>>();
+
+    for step in pending_steps {
         if is_task_stopped_or_paused(task_id, &state).await {
             return Ok(());
         }
@@ -875,6 +901,7 @@ async fn run_task_pipeline(task_id: Uuid, state: AppState) -> Result<(), String>
             .await;
 
             if verify.success {
+                mark_step_success(task_id, step.step_order, state.clone()).await;
                 success = true;
                 break;
             }
@@ -1004,6 +1031,15 @@ async fn append_step_log(
     persist_store(&store);
 }
 
+async fn mark_step_success(task_id: Uuid, step_order: u32, state: AppState) {
+    let mut store = state.store.write().await;
+    if let Some(task) = store.tasks.get_mut(&task_id) {
+        task.next_step_order = step_order + 1;
+        task.updated_at = Utc::now();
+    }
+    persist_store(&store);
+}
+
 async fn finalize_task(
     task_id: Uuid,
     status: TaskStatus,
@@ -1024,6 +1060,9 @@ async fn finalize_task(
             return;
         }
         task.updated_at = Utc::now();
+        if status == TaskStatus::Passed {
+            task.next_step_order = task.planned_steps.len() as u32 + 1;
+        }
 
         let screenshots = task
             .step_logs
@@ -1106,26 +1145,41 @@ fn planner_plan(goal: &str, params: &serde_json::Value) -> PlanResult {
             vec!["username", "password"],
             params,
             vec![
-                step(
-                    1,
-                    "识别当前是否在登录页",
-                    ActionType::Observe,
-                    serde_json::json!({}),
-                    "识别到登录页",
+                with_rules(
+                    step(
+                        1,
+                        "识别当前是否在登录页",
+                        ActionType::Observe,
+                        serde_json::json!({}),
+                        "识别到登录页",
+                    ),
+                    vec![VerifyRule::CurrentPageIs {
+                        value: "login_page".to_string(),
+                    }],
                 ),
-                step(
-                    2,
-                    "输入账号密码",
-                    ActionType::Input,
-                    serde_json::json!({"fields":["username","password"]}),
-                    "账号密码填充成功",
+                with_rules(
+                    step(
+                        2,
+                        "输入账号密码",
+                        ActionType::Input,
+                        serde_json::json!({"fields":["username","password"]}),
+                        "账号密码填充成功",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "账号输入框".to_string(),
+                    }],
                 ),
-                step(
-                    3,
-                    "点击登录按钮",
-                    ActionType::Tap,
-                    serde_json::json!({"target":"登录"}),
-                    "进入首页或出现明确错误提示",
+                with_rules(
+                    step(
+                        3,
+                        "点击登录按钮",
+                        ActionType::Tap,
+                        serde_json::json!({"target":"登录"}),
+                        "进入首页或出现明确错误提示",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "登录".to_string(),
+                    }],
                 ),
             ],
         );
@@ -1137,26 +1191,41 @@ fn planner_plan(goal: &str, params: &serde_json::Value) -> PlanResult {
             vec!["keyword"],
             params,
             vec![
-                step(
-                    1,
-                    "定位搜索框",
-                    ActionType::Observe,
-                    serde_json::json!({}),
-                    "搜索框可用",
+                with_rules(
+                    step(
+                        1,
+                        "定位搜索框",
+                        ActionType::Observe,
+                        serde_json::json!({}),
+                        "搜索框可用",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "搜索框".to_string(),
+                    }],
                 ),
-                step(
-                    2,
-                    "输入关键词",
-                    ActionType::Input,
-                    serde_json::json!({"field":"keyword"}),
-                    "关键词输入成功",
+                with_rules(
+                    step(
+                        2,
+                        "输入关键词",
+                        ActionType::Input,
+                        serde_json::json!({"field":"keyword"}),
+                        "关键词输入成功",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "搜索框".to_string(),
+                    }],
                 ),
-                step(
-                    3,
-                    "点击搜索按钮",
-                    ActionType::Tap,
-                    serde_json::json!({"target":"搜索"}),
-                    "展示搜索结果或空状态",
+                with_rules(
+                    step(
+                        3,
+                        "点击搜索按钮",
+                        ActionType::Tap,
+                        serde_json::json!({"target":"搜索"}),
+                        "展示搜索结果或空状态",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "搜索".to_string(),
+                    }],
                 ),
             ],
         );
@@ -1168,26 +1237,41 @@ fn planner_plan(goal: &str, params: &serde_json::Value) -> PlanResult {
             vec!["form_data"],
             params,
             vec![
-                step(
-                    1,
-                    "进入表单页并定位必填项",
-                    ActionType::Observe,
-                    serde_json::json!({}),
-                    "识别到必填项",
+                with_rules(
+                    step(
+                        1,
+                        "进入表单页并定位必填项",
+                        ActionType::Observe,
+                        serde_json::json!({}),
+                        "识别到必填项",
+                    ),
+                    vec![VerifyRule::CurrentPageIs {
+                        value: "form_page".to_string(),
+                    }],
                 ),
-                step(
-                    2,
-                    "填写并提交表单",
-                    ActionType::Input,
-                    serde_json::json!({"field":"form_data"}),
-                    "表单提交成功",
+                with_rules(
+                    step(
+                        2,
+                        "填写并提交表单",
+                        ActionType::Input,
+                        serde_json::json!({"field":"form_data"}),
+                        "表单提交成功",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "提交".to_string(),
+                    }],
                 ),
-                step(
-                    3,
-                    "验证成功提示",
-                    ActionType::Verify,
-                    serde_json::json!({"contains":"提交成功"}),
-                    "出现提交成功提示",
+                with_rules(
+                    step(
+                        3,
+                        "验证成功提示",
+                        ActionType::Verify,
+                        serde_json::json!({"contains":"提交成功"}),
+                        "出现提交成功提示",
+                    ),
+                    vec![VerifyRule::TextContains {
+                        value: "提交成功".to_string(),
+                    }],
                 ),
             ],
         );
@@ -1199,26 +1283,41 @@ fn planner_plan(goal: &str, params: &serde_json::Value) -> PlanResult {
             vec!["filter_condition"],
             params,
             vec![
-                step(
-                    1,
-                    "进入列表页",
-                    ActionType::Observe,
-                    serde_json::json!({}),
-                    "列表页可见",
+                with_rules(
+                    step(
+                        1,
+                        "进入列表页",
+                        ActionType::Observe,
+                        serde_json::json!({}),
+                        "列表页可见",
+                    ),
+                    vec![VerifyRule::CurrentPageIs {
+                        value: "list_page".to_string(),
+                    }],
                 ),
-                step(
-                    2,
-                    "打开筛选并选择条件",
-                    ActionType::Tap,
-                    serde_json::json!({"target":"筛选"}),
-                    "筛选条件已选择",
+                with_rules(
+                    step(
+                        2,
+                        "打开筛选并选择条件",
+                        ActionType::Tap,
+                        serde_json::json!({"target":"筛选"}),
+                        "筛选条件已选择",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "筛选".to_string(),
+                    }],
                 ),
-                step(
-                    3,
-                    "点击确认并验证列表刷新",
-                    ActionType::Verify,
-                    serde_json::json!({"contains":"filtered"}),
-                    "结果符合筛选条件",
+                with_rules(
+                    step(
+                        3,
+                        "点击确认并验证列表刷新",
+                        ActionType::Verify,
+                        serde_json::json!({"contains":"filtered"}),
+                        "结果符合筛选条件",
+                    ),
+                    vec![VerifyRule::TextContains {
+                        value: "filtered".to_string(),
+                    }],
                 ),
             ],
         );
@@ -1230,19 +1329,29 @@ fn planner_plan(goal: &str, params: &serde_json::Value) -> PlanResult {
             vec!["username", "password"],
             params,
             vec![
-                step(
-                    1,
-                    "输入错误账号密码",
-                    ActionType::Input,
-                    serde_json::json!({"invalid":true}),
-                    "错误数据输入成功",
+                with_rules(
+                    step(
+                        1,
+                        "输入错误账号密码",
+                        ActionType::Input,
+                        serde_json::json!({"invalid":true}),
+                        "错误数据输入成功",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "账号输入框".to_string(),
+                    }],
                 ),
-                step(
-                    2,
-                    "点击登录并检查错误提示",
-                    ActionType::Verify,
-                    serde_json::json!({"contains":"错误"}),
-                    "出现明确错误提示",
+                with_rules(
+                    step(
+                        2,
+                        "点击登录并检查错误提示",
+                        ActionType::Verify,
+                        serde_json::json!({"contains":"错误"}),
+                        "出现明确错误提示",
+                    ),
+                    vec![VerifyRule::TextContains {
+                        value: "错误".to_string(),
+                    }],
                 ),
             ],
         );
@@ -1252,12 +1361,17 @@ fn planner_plan(goal: &str, params: &serde_json::Value) -> PlanResult {
         "generic",
         vec![],
         params,
-        vec![step(
-            1,
-            "执行通用页面可交互性检查",
-            ActionType::Observe,
-            serde_json::json!({}),
-            "页面可正常交互",
+        vec![with_rules(
+            step(
+                1,
+                "执行通用页面可交互性检查",
+                ActionType::Observe,
+                serde_json::json!({}),
+                "页面可正常交互",
+            ),
+            vec![VerifyRule::CurrentPageIs {
+                value: "generic_page".to_string(),
+            }],
         )],
     )
 }
@@ -1275,7 +1389,13 @@ fn step(
         action_type,
         action_params,
         expected_result: expected.to_string(),
+        verify_rules: vec![],
     }
+}
+
+fn with_rules(mut s: PlannedStep, rules: Vec<VerifyRule>) -> PlannedStep {
+    s.verify_rules = rules;
+    s
 }
 
 fn scenario_plan(
@@ -1316,17 +1436,29 @@ async fn observer_observe(
     .to_string();
 
     let screenshot_url = format!("s3://mock/{}/step_{}.jpg", task_id, step_order);
+    let elements = match current_page.as_str() {
+        "login_page" => vec![
+            serde_json::json!({"type":"input","name":"账号输入框","clickable":true}),
+            serde_json::json!({"type":"input","name":"密码输入框","clickable":true}),
+            serde_json::json!({"type":"button","name":"登录","clickable":true}),
+        ],
+        "search_page" => vec![
+            serde_json::json!({"type":"input","name":"搜索框","clickable":true}),
+            serde_json::json!({"type":"button","name":"搜索","clickable":true}),
+        ],
+        "form_page" => vec![
+            serde_json::json!({"type":"input","name":"姓名","clickable":true}),
+            serde_json::json!({"type":"button","name":"提交","clickable":true}),
+        ],
+        "list_page" => vec![
+            serde_json::json!({"type":"button","name":"筛选","clickable":true}),
+            serde_json::json!({"type":"list","name":"结果列表","clickable":false}),
+        ],
+        _ => vec![serde_json::json!({"type":"container","name":"页面主体","clickable":false})],
+    };
     let page_tree = serde_json::json!({
         "current_page": current_page,
-        "elements": [
-            {"type":"input","name":"账号输入框","clickable":true},
-            {"type":"input","name":"密码输入框","clickable":true},
-            {"type":"input","name":"搜索框","clickable":true},
-            {"type":"button","name":"登录","clickable":true},
-            {"type":"button","name":"搜索","clickable":true},
-            {"type":"button","name":"筛选","clickable":true},
-            {"type":"button","name":"提交","clickable":true}
-        ],
+        "elements": elements,
         "status":"ready"
     });
 
@@ -1380,12 +1512,46 @@ async fn execute_action(
 ) -> ActionResult {
     let start = Instant::now();
     let (tool_name, output) = match action.action_type {
-        ActionType::Observe => ("tree", serde_json::json!({"status":"ok"})),
-        ActionType::Tap => ("tap", serde_json::json!({"status":"ok"})),
-        ActionType::Input => ("input", serde_json::json!({"status":"ok"})),
-        ActionType::Swipe => ("swipe", serde_json::json!({"status":"ok"})),
-        ActionType::Verify => ("verify", serde_json::json!({"status":"ok"})),
-        ActionType::AgentAct => ("agent_act", serde_json::json!({"status":"ok"})),
+        ActionType::Observe => (
+            "tree",
+            serde_json::json!({"status":"ok","message":"页面结构已获取"}),
+        ),
+        ActionType::Tap => (
+            "tap",
+            serde_json::json!({"status":"ok","message":"点击成功"}),
+        ),
+        ActionType::Input => (
+            "input",
+            serde_json::json!({"status":"ok","message":"输入成功"}),
+        ),
+        ActionType::Swipe => (
+            "swipe",
+            serde_json::json!({"status":"ok","message":"滑动成功"}),
+        ),
+        ActionType::Verify => (
+            "verify",
+            serde_json::json!({"status":"ok","message":"校验动作执行"}),
+        ),
+        ActionType::AgentAct => {
+            let instruction = action
+                .action_params
+                .get("instruction")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default();
+            let message = if instruction.contains("错误提示") {
+                "错误提示已出现"
+            } else if instruction.contains("成功提示") {
+                "提交成功"
+            } else if instruction.contains("筛选") {
+                "filtered list ready"
+            } else {
+                "agent action done"
+            };
+            (
+                "agent_act",
+                serde_json::json!({"status":"ok","message":message}),
+            )
+        }
     };
 
     let log = ToolCallLog {
@@ -1430,7 +1596,17 @@ fn verifier_verify(
         .cloned()
         .unwrap_or_default();
 
-    if step.description.contains("登录") {
+    for rule in &step.verify_rules {
+        if let Some(reason) = check_verify_rule(rule, &elements, observe, action_result) {
+            return VerifyResult {
+                success: false,
+                reason,
+                actual_result: "断言失败".to_string(),
+            };
+        }
+    }
+
+    if step.verify_rules.is_empty() && step.description.contains("登录") {
         let has_login = elements.iter().any(|e| {
             e.get("name")
                 .and_then(|x| x.as_str())
@@ -1450,6 +1626,48 @@ fn verifier_verify(
         success: true,
         reason: "验证通过".to_string(),
         actual_result: format!("{}: 执行成功", step.description),
+    }
+}
+
+fn check_verify_rule(
+    rule: &VerifyRule,
+    elements: &[serde_json::Value],
+    observe: &ObserveResult,
+    action_result: &ActionResult,
+) -> Option<String> {
+    match rule {
+        VerifyRule::ElementExists { name } => {
+            let found = elements.iter().any(|e| {
+                e.get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .contains(name)
+            });
+            if found {
+                None
+            } else {
+                Some(format!("元素缺失: {}", name))
+            }
+        }
+        VerifyRule::TextContains { value } => {
+            let text = action_result
+                .output
+                .get("message")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default();
+            if text.contains(value) {
+                None
+            } else {
+                Some(format!("文本断言失败: 缺少 {}", value))
+            }
+        }
+        VerifyRule::CurrentPageIs { value } => {
+            if &observe.current_page == value {
+                None
+            } else {
+                Some(format!("页面断言失败: 当前为 {}", observe.current_page))
+            }
+        }
     }
 }
 
@@ -1637,6 +1855,31 @@ mod tests {
     }
 
     #[test]
+    fn planner_step_should_include_verify_rules() {
+        let p = planner_plan("测试登录流程", &serde_json::json!({}));
+        assert!(!p.steps[0].verify_rules.is_empty());
+    }
+
+    #[test]
+    fn verify_rule_should_check_current_page() {
+        let rule = VerifyRule::CurrentPageIs {
+            value: "login_page".to_string(),
+        };
+        let observe = ObserveResult {
+            current_page: "search_page".to_string(),
+            page_tree: serde_json::json!({"elements":[]}),
+            screenshot_url: "mock.jpg".to_string(),
+        };
+        let result = check_verify_rule(
+            &rule,
+            &[],
+            &observe,
+            &ActionResult {
+                success: true,
+                output: serde_json::json!({}),
+            },
+        );
+        assert!(result.is_some());
     fn status_transition_should_be_checked() {
         assert!(can_transition(&TaskStatus::Pending, &TaskStatus::Running));
         assert!(can_transition(&TaskStatus::Running, &TaskStatus::Passed));
