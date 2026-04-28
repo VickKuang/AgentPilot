@@ -188,7 +188,7 @@ struct UpdateTaskDataRequest {
     params: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CreateTaskResponse {
     task_id: Uuid,
     scenario: String,
@@ -198,7 +198,7 @@ struct CreateTaskResponse {
     planned_steps: Vec<PlannedStep>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct TaskProgress {
     task_id: Uuid,
     status: TaskStatus,
@@ -231,7 +231,17 @@ async fn main() {
         store: Arc::new(RwLock::new(Store::load())),
     };
 
-    let app = Router::new()
+    let app = build_app(state);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    info!("autotest-agent listening on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+fn build_app(state: AppState) -> Router {
+    Router::new()
         .route("/health", get(health))
         .route("/api/v1/tasks", post(create_task).get(list_tasks))
         .route("/api/v1/tasks/:task_id", get(get_task))
@@ -252,13 +262,7 @@ async fn main() {
             get(export_report_markdown),
         )
         .nest_service("/", ServeDir::new("web"))
-        .with_state(state);
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
-    info!("autotest-agent listening on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+        .with_state(state)
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -1308,6 +1312,31 @@ fn persist_store(store: &Store) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use std::{
+        fs,
+        sync::{Mutex, OnceLock},
+    };
+    use tower::util::ServiceExt;
+
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn reset_store_file() {
+        let _ = fs::remove_file(STORE_FILE);
+    }
+
+    fn test_app() -> Router {
+        let state = AppState {
+            store: Arc::new(RwLock::new(Store::default())),
+        };
+        build_app(state)
+    }
 
     #[test]
     fn planner_should_cover_list_filter() {
@@ -1331,5 +1360,183 @@ mod tests {
         let raw = serde_json::json!({"username":"u","password":"abc"});
         let masked = mask_sensitive_json(&raw);
         assert_eq!(masked.get("password").unwrap(), "***");
+    }
+
+    #[tokio::test]
+    async fn api_should_block_start_without_required_data() {
+        let _guard = test_lock().lock().unwrap();
+        reset_store_file();
+
+        let app = test_app();
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/tasks")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "task_name":"login-missing-param",
+                    "user_goal":"测试登录流程",
+                    "params":{"username":"demo"}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let create_resp = app.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let create_body = to_bytes(create_resp.into_body(), usize::MAX).await.unwrap();
+        let created: CreateTaskResponse = serde_json::from_slice(&create_body).unwrap();
+        assert_eq!(created.status, TaskStatus::Blocked);
+
+        let start_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/tasks/{}/start", created.task_id))
+            .body(Body::empty())
+            .unwrap();
+        let start_resp = app.clone().oneshot(start_req).await.unwrap();
+        assert_eq!(start_resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_should_complete_lifecycle_and_generate_report() {
+        let _guard = test_lock().lock().unwrap();
+        reset_store_file();
+
+        let app = test_app();
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/tasks")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "task_name":"login-success",
+                    "user_goal":"测试登录流程",
+                    "params":{"username":"demo","password":"123456"}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let create_resp = app.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let create_body = to_bytes(create_resp.into_body(), usize::MAX).await.unwrap();
+        let created: CreateTaskResponse = serde_json::from_slice(&create_body).unwrap();
+        assert_eq!(created.status, TaskStatus::Pending);
+
+        let start_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/tasks/{}/start", created.task_id))
+            .body(Body::empty())
+            .unwrap();
+        let start_resp = app.clone().oneshot(start_req).await.unwrap();
+        assert_eq!(start_resp.status(), StatusCode::OK);
+
+        let mut final_progress = None;
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let progress_req = Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/tasks/{}/progress", created.task_id))
+                .body(Body::empty())
+                .unwrap();
+            let progress_resp = app.clone().oneshot(progress_req).await.unwrap();
+            assert_eq!(progress_resp.status(), StatusCode::OK);
+            let progress_body = to_bytes(progress_resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let progress: TaskProgress = serde_json::from_slice(&progress_body).unwrap();
+
+            if progress.status == TaskStatus::Passed || progress.status == TaskStatus::Failed {
+                final_progress = Some(progress);
+                break;
+            }
+        }
+
+        let progress = final_progress.expect("task should reach terminal status");
+        assert_eq!(progress.status, TaskStatus::Passed);
+        assert_eq!(progress.progress_percent, 100);
+
+        let report_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/tasks/{}/report", created.task_id))
+            .body(Body::empty())
+            .unwrap();
+        let report_resp = app.clone().oneshot(report_req).await.unwrap();
+        assert_eq!(report_resp.status(), StatusCode::OK);
+        let report_body = to_bytes(report_resp.into_body(), usize::MAX).await.unwrap();
+        let report: TestReport = serde_json::from_slice(&report_body).unwrap();
+        assert_eq!(report.result, TaskStatus::Passed);
+        assert!(!report.steps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn markdown_export_should_match_regression_baseline() {
+        let _guard = test_lock().lock().unwrap();
+        reset_store_file();
+
+        let app = test_app();
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/tasks")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "task_name":"generic-smoke",
+                    "user_goal":"执行一次通用检查",
+                    "params":{}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let create_resp = app.clone().oneshot(create_req).await.unwrap();
+        let create_body = to_bytes(create_resp.into_body(), usize::MAX).await.unwrap();
+        let created: CreateTaskResponse = serde_json::from_slice(&create_body).unwrap();
+
+        let start_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/tasks/{}/start", created.task_id))
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.clone().oneshot(start_req).await.unwrap();
+
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let progress_req = Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/tasks/{}/progress", created.task_id))
+                .body(Body::empty())
+                .unwrap();
+            let progress_resp = app.clone().oneshot(progress_req).await.unwrap();
+            let progress_body = to_bytes(progress_resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let progress: TaskProgress = serde_json::from_slice(&progress_body).unwrap();
+            if progress.status == TaskStatus::Passed {
+                break;
+            }
+        }
+
+        let export_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/tasks/{}/report/export", created.task_id))
+            .body(Body::empty())
+            .unwrap();
+        let export_resp = app.clone().oneshot(export_req).await.unwrap();
+        assert_eq!(export_resp.status(), StatusCode::OK);
+        let markdown_body = to_bytes(export_resp.into_body(), usize::MAX).await.unwrap();
+        let markdown = String::from_utf8(markdown_body.to_vec()).unwrap();
+
+        let baseline_raw =
+            fs::read_to_string("tests/fixtures/report_markdown_baseline.json").unwrap();
+        let baseline: serde_json::Value = serde_json::from_str(&baseline_raw).unwrap();
+        let phrases = baseline
+            .get("required_phrases")
+            .and_then(|v| v.as_array())
+            .unwrap();
+
+        for phrase in phrases {
+            let text = phrase.as_str().unwrap();
+            assert!(markdown.contains(text), "markdown should include: {text}");
+        }
     }
 }
