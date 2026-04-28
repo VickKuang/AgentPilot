@@ -133,11 +133,19 @@ curl http://127.0.0.1:8080/api/v1/tasks/<task_id>/report
 
 ## 🗺️ Roadmap（下一步）
 
-- [ ] 替换 mock 工具层为真实驱动（Playwright/WebDriver/Appium）
-- [ ] 引入 PostgreSQL（替代 `store.json`）
-- [ ] 增加鉴权与多租户隔离
-- [ ] WebSocket 实时推送执行状态
-- [ ] 与 Jira/飞书/企微打通自动提单
+- [x] 替换 mock 工具层为真实驱动（支持通过 `DRIVER_BASE_URL` 对接外部驱动）
+- [x] 引入 PostgreSQL（通过 `DATABASE_URL` 启用，替代 `store.json`）
+- [x] 增加鉴权与多租户隔离（`x-api-key` + `x-tenant-id`）
+- [x] WebSocket 实时推送执行状态（`/api/v1/tasks/:task_id/ws`）
+- [x] 与 Jira/飞书/企微打通自动提单（失败时 webhook 推送）
+
+## ⚙️ Deployment Env（新增）
+
+- `DATABASE_URL`：启用 PostgreSQL 持久化（未配置则使用 `data/store.json`）。
+- `API_KEY`：配置后所有 API 需携带 `x-api-key`。
+- `DRIVER_BASE_URL`：配置后 `observe/action` 将转发到真实驱动。
+- `JIRA_WEBHOOK_URL` / `FEISHU_WEBHOOK_URL` / `WECOM_WEBHOOK_URL`：任务失败后自动推送缺陷信息。
+- `x-tenant-id` 请求头：租户隔离必填字段。
 
 ---
 
