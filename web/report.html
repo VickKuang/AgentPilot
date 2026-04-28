@@ -17,6 +17,17 @@
   <button onclick="exportMd()">导出 Markdown</button>
   <div id="error" class="error"></div>
   <h3>测试报告</h3>
+  <button onclick="exportReport('markdown')">导出 Markdown</button>
+  <button onclick="exportReport('html')">导出 HTML</button>
+  <button onclick="exportReport('pdf')">导出 PDF</button>
+  <br/><br/>
+  <label>自定义模板（可选，支持 {{task_id}} / {{result}} / {{summary}} / {{issue_summary}} / {{steps}} / {{bug_section}}）</label>
+  <br/>
+  <textarea id="template" style="width:100%;height:120px" placeholder="# 自定义报告
+
+任务：{{task_id}}
+结论：{{result}}
+{{steps}}"></textarea>
   <pre id="report"></pre>
   <h3>Bug 报告</h3>
   <pre id="bug"></pre>
@@ -90,6 +101,20 @@
       } catch (err) {
         showError(err.message || '导出失败');
       }
+    async function exportReport(format) {
+      const template = document.getElementById('template').value.trim();
+      const query = new URLSearchParams({ format });
+      if (template) query.set('template', template);
+
+      const res = await fetch(`/api/v1/tasks/${taskId}/report/export?${query.toString()}`);
+      if (format === 'pdf') {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        window.open(url, '_blank');
+        document.getElementById('export').textContent = 'PDF 已在新标签页打开';
+        return;
+      }
+      document.getElementById('export').textContent = await res.text();
     }
 
     loadReport();
