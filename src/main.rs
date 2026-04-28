@@ -8,7 +8,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, patch, post},
@@ -215,6 +215,41 @@ struct ApiError {
     message: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct StepLogQuery {
+    step_order: Option<u32>,
+    status: Option<String>,
+    started_at: Option<String>,
+    ended_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolCallQuery {
+    step_order: Option<u32>,
+    success: Option<bool>,
+    tool_name: Option<String>,
+    started_at: Option<String>,
+    ended_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotQuery {
+    step_order: Option<u32>,
+    current_page: Option<String>,
+    started_at: Option<String>,
+    ended_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskFailureAggregation {
+    task_id: Uuid,
+    failed_steps: usize,
+    failed_step_orders: Vec<u32>,
+    failed_step_names: Vec<String>,
+    failed_tools: Vec<String>,
+    latest_failed_at: Option<DateTime<Utc>>,
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         (StatusCode::BAD_REQUEST, Json(self)).into_response()
@@ -243,6 +278,10 @@ async fn main() {
         .route("/api/v1/tasks/:task_id/terminate", post(terminate_task))
         .route("/api/v1/tasks/:task_id/progress", get(get_progress))
         .route("/api/v1/tasks/:task_id/logs", get(get_logs))
+        .route(
+            "/api/v1/tasks/:task_id/logs/failures",
+            get(get_failure_aggregation),
+        )
         .route("/api/v1/tasks/:task_id/tool-calls", get(get_tool_calls))
         .route("/api/v1/tasks/:task_id/snapshots", get(get_snapshots))
         .route("/api/v1/tasks/:task_id/report", get(get_report))
@@ -550,33 +589,125 @@ async fn get_progress(
 async fn get_logs(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Query(query): Query<StepLogQuery>,
 ) -> Result<Json<Vec<StepLog>>, ApiError> {
     let store = state.store.read().await;
     let task = store.tasks.get(&task_id).ok_or(ApiError {
         code: "task_not_found",
         message: format!("task {} not found", task_id),
     })?;
-    Ok(Json(task.step_logs.clone()))
+
+    let started_at = parse_optional_datetime(query.started_at.as_deref(), "started_at")?;
+    let ended_at = parse_optional_datetime(query.ended_at.as_deref(), "ended_at")?;
+    validate_time_range(started_at, ended_at)?;
+
+    let status = query.status.as_deref();
+    let logs = task
+        .step_logs
+        .iter()
+        .filter(|x| query.step_order.is_none_or(|order| x.step_order == order))
+        .filter(|x| status.is_none_or(|status| x.status.eq_ignore_ascii_case(status)))
+        .filter(|x| started_at.is_none_or(|start| x.created_at >= start))
+        .filter(|x| ended_at.is_none_or(|end| x.created_at <= end))
+        .cloned()
+        .collect();
+
+    Ok(Json(logs))
+}
+
+async fn get_failure_aggregation(
+    AxumPath(task_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+) -> Result<Json<TaskFailureAggregation>, ApiError> {
+    let store = state.store.read().await;
+    let task = store.tasks.get(&task_id).ok_or(ApiError {
+        code: "task_not_found",
+        message: format!("task {} not found", task_id),
+    })?;
+
+    let failed_logs = task
+        .step_logs
+        .iter()
+        .filter(|x| x.status.eq_ignore_ascii_case("failed"))
+        .collect::<Vec<_>>();
+
+    let failed_step_orders = failed_logs.iter().map(|x| x.step_order).collect::<Vec<_>>();
+    let failed_step_names = failed_logs
+        .iter()
+        .map(|x| x.step_name.clone())
+        .collect::<Vec<_>>();
+    let latest_failed_at = failed_logs.iter().map(|x| x.created_at).max();
+
+    let failed_tools = store
+        .tool_calls
+        .get(&task_id)
+        .into_iter()
+        .flatten()
+        .filter(|x| !x.success)
+        .map(|x| x.tool_name.clone())
+        .collect::<Vec<_>>();
+
+    Ok(Json(TaskFailureAggregation {
+        task_id,
+        failed_steps: failed_logs.len(),
+        failed_step_orders,
+        failed_step_names,
+        failed_tools,
+        latest_failed_at,
+    }))
 }
 
 async fn get_tool_calls(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Query(query): Query<ToolCallQuery>,
 ) -> Result<Json<Vec<ToolCallLog>>, ApiError> {
     let store = state.store.read().await;
-    Ok(Json(
-        store.tool_calls.get(&task_id).cloned().unwrap_or_default(),
-    ))
+    let started_at = parse_optional_datetime(query.started_at.as_deref(), "started_at")?;
+    let ended_at = parse_optional_datetime(query.ended_at.as_deref(), "ended_at")?;
+    validate_time_range(started_at, ended_at)?;
+
+    let tool_name = query.tool_name.as_deref();
+    let tool_calls = store
+        .tool_calls
+        .get(&task_id)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|x| query.step_order.is_none_or(|order| x.step_order == order))
+        .filter(|x| query.success.is_none_or(|success| x.success == success))
+        .filter(|x| tool_name.is_none_or(|name| x.tool_name.eq_ignore_ascii_case(name)))
+        .filter(|x| started_at.is_none_or(|start| x.created_at >= start))
+        .filter(|x| ended_at.is_none_or(|end| x.created_at <= end))
+        .collect::<Vec<_>>();
+
+    Ok(Json(tool_calls))
 }
 
 async fn get_snapshots(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<Vec<PageSnapshot>>, ApiError> {
     let store = state.store.read().await;
-    Ok(Json(
-        store.snapshots.get(&task_id).cloned().unwrap_or_default(),
-    ))
+    let started_at = parse_optional_datetime(query.started_at.as_deref(), "started_at")?;
+    let ended_at = parse_optional_datetime(query.ended_at.as_deref(), "ended_at")?;
+    validate_time_range(started_at, ended_at)?;
+
+    let current_page = query.current_page.as_deref();
+    let snapshots = store
+        .snapshots
+        .get(&task_id)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|x| query.step_order.is_none_or(|order| x.step_order == order))
+        .filter(|x| current_page.is_none_or(|page| x.current_page.eq_ignore_ascii_case(page)))
+        .filter(|x| started_at.is_none_or(|start| x.created_at >= start))
+        .filter(|x| ended_at.is_none_or(|end| x.created_at <= end))
+        .collect::<Vec<_>>();
+
+    Ok(Json(snapshots))
 }
 
 async fn get_report(
@@ -1303,6 +1434,37 @@ fn persist_store(store: &Store) {
     if let Err(err) = store.save() {
         error!("persist store failed: {}", err);
     }
+}
+
+fn parse_optional_datetime(
+    raw: Option<&str>,
+    field: &str,
+) -> Result<Option<DateTime<Utc>>, ApiError> {
+    raw.map(|value| {
+        DateTime::parse_from_rfc3339(value)
+            .map(|x| x.with_timezone(&Utc))
+            .map_err(|_| ApiError {
+                code: "invalid_query_param",
+                message: format!("{} must be RFC3339 datetime", field),
+            })
+    })
+    .transpose()
+}
+
+fn validate_time_range(
+    started_at: Option<DateTime<Utc>>,
+    ended_at: Option<DateTime<Utc>>,
+) -> Result<(), ApiError> {
+    if let (Some(start), Some(end)) = (started_at, ended_at) {
+        if start > end {
+            return Err(ApiError {
+                code: "invalid_time_range",
+                message: "started_at must be earlier than or equal to ended_at".to_string(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
