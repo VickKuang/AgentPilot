@@ -8,7 +8,14 @@ use std::{
 };
 
 use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path as AxumPath, State,
+    },
     extract::{Path as AxumPath, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, patch, post},
@@ -243,6 +250,8 @@ struct TestTask {
     max_step_retries: u8,
     step_timeout_ms: u64,
     global_timeout_ms: u64,
+    #[serde(default = "default_next_step_order")]
+    next_step_order: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,6 +261,20 @@ struct PlannedStep {
     action_type: ActionType,
     action_params: serde_json::Value,
     expected_result: String,
+    #[serde(default)]
+    verify_rules: Vec<VerifyRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum VerifyRule {
+    ElementExists { name: String },
+    TextContains { value: String },
+    CurrentPageIs { value: String },
+}
+
+fn default_next_step_order() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,10 +376,66 @@ struct TaskProgress {
     progress_percent: u8,
 }
 
+#[derive(Debug, Deserialize)]
+struct ListTasksQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
+    status: Option<String>,
+    sort_by: Option<String>,
+    sort_order: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListTasksResponse {
+    items: Vec<TestTask>,
+    page: usize,
+    page_size: usize,
+    total: usize,
+    total_pages: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct ApiError {
     code: &'static str,
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExportReportQuery {
+    format: Option<String>,
+    template: Option<String>,
+struct StepLogQuery {
+    step_order: Option<u32>,
+    status: Option<String>,
+    started_at: Option<String>,
+    ended_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolCallQuery {
+    step_order: Option<u32>,
+    success: Option<bool>,
+    tool_name: Option<String>,
+    started_at: Option<String>,
+    ended_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotQuery {
+    step_order: Option<u32>,
+    current_page: Option<String>,
+    started_at: Option<String>,
+    ended_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskFailureAggregation {
+    task_id: Uuid,
+    failed_steps: usize,
+    failed_step_orders: Vec<u32>,
+    failed_step_names: Vec<String>,
+    failed_tools: Vec<String>,
+    latest_failed_at: Option<DateTime<Utc>>,
 }
 
 impl IntoResponse for ApiError {
@@ -392,7 +471,12 @@ async fn main() {
         .route("/api/v1/tasks/:task_id/resume", post(resume_task))
         .route("/api/v1/tasks/:task_id/terminate", post(terminate_task))
         .route("/api/v1/tasks/:task_id/progress", get(get_progress))
+        .route("/api/v1/tasks/:task_id/ws", get(task_ws))
         .route("/api/v1/tasks/:task_id/logs", get(get_logs))
+        .route(
+            "/api/v1/tasks/:task_id/logs/failures",
+            get(get_failure_aggregation),
+        )
         .route("/api/v1/tasks/:task_id/tool-calls", get(get_tool_calls))
         .route("/api/v1/tasks/:task_id/snapshots", get(get_snapshots))
         .route("/api/v1/tasks/:task_id/report", get(get_report))
@@ -444,6 +528,7 @@ async fn create_task(
         max_step_retries: 2,
         step_timeout_ms: 4_000,
         global_timeout_ms: 45_000,
+        next_step_order: 1,
     };
 
     let task_id = task.task_id;
@@ -486,11 +571,12 @@ async fn update_task_data(
         .cloned()
         .collect();
 
-    task.status = if task.missing_data.is_empty() {
+    let new_status = if task.missing_data.is_empty() {
         TaskStatus::Pending
     } else {
         TaskStatus::Blocked
     };
+    transition_task_status(task, new_status, "update_task_data")?;
     task.updated_at = Utc::now();
 
     let out = task.clone();
@@ -498,8 +584,45 @@ async fn update_task_data(
     Ok(Json(out))
 }
 
-async fn list_tasks(State(state): State<AppState>) -> Json<Vec<TestTask>> {
-    Json(state.store.read().await.tasks.values().cloned().collect())
+async fn list_tasks(
+    State(state): State<AppState>,
+    Query(query): Query<ListTasksQuery>,
+) -> Result<Json<ListTasksResponse>, ApiError> {
+    let store = state.store.read().await;
+    let mut tasks = store.tasks.values().cloned().collect::<Vec<_>>();
+
+    if let Some(raw_status) = query.status {
+        let status = parse_task_status(&raw_status)?;
+        tasks.retain(|t| t.status == status);
+    }
+
+    let sort_by = query.sort_by.unwrap_or_else(|| "created_at".to_string());
+    let sort_order = query.sort_order.unwrap_or_else(|| "desc".to_string());
+    sort_tasks(&mut tasks, &sort_by, &sort_order)?;
+
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let page = query.page.unwrap_or(1).max(1);
+    let total = tasks.len();
+    let total_pages = if total == 0 {
+        0
+    } else {
+        total.div_ceil(page_size)
+    };
+    let start = (page - 1) * page_size;
+    let items = if start >= total {
+        vec![]
+    } else {
+        let end = (start + page_size).min(total);
+        tasks[start..end].to_vec()
+    };
+
+    Ok(Json(ListTasksResponse {
+        items,
+        page,
+        page_size,
+        total,
+        total_pages,
+    }))
 }
 
 async fn get_task(
@@ -532,9 +655,10 @@ async fn start_task(
             });
         }
 
-        task.status = TaskStatus::Running;
+        transition_task_status(task, TaskStatus::Running, "start_task")?;
         task.updated_at = Utc::now();
         task.step_logs.clear();
+        task.next_step_order = 1;
         store.reports.remove(&task_id);
         store.tool_calls.entry(task_id).or_default().clear();
         store.snapshots.entry(task_id).or_default().clear();
@@ -572,8 +696,9 @@ async fn retry_task(
         }
 
         task.retries += 1;
-        task.status = TaskStatus::Running;
+        transition_task_status(task, TaskStatus::Running, "retry_task")?;
         task.step_logs.clear();
+        task.next_step_order = 1;
         task.updated_at = Utc::now();
         store.reports.remove(&task_id);
         persist_store(&state, &store).await;
@@ -600,7 +725,7 @@ async fn pause_task(
         code: "task_not_found",
         message: format!("task {} not found", task_id),
     })?;
-    task.status = TaskStatus::Paused;
+    transition_task_status(task, TaskStatus::Paused, "pause_task")?;
     task.updated_at = Utc::now();
     persist_store(&state, &store).await;
     Ok(Json(
@@ -618,13 +743,7 @@ async fn resume_task(
             code: "task_not_found",
             message: format!("task {} not found", task_id),
         })?;
-        if task.status != TaskStatus::Paused {
-            return Err(ApiError {
-                code: "not_paused",
-                message: "task is not paused".to_string(),
-            });
-        }
-        task.status = TaskStatus::Running;
+        transition_task_status(task, TaskStatus::Running, "resume_task")?;
         task.updated_at = Utc::now();
         persist_store(&state, &store).await;
     }
@@ -651,7 +770,7 @@ async fn terminate_task(
         message: format!("task {} not found", task_id),
     })?;
 
-    task.status = TaskStatus::Terminated;
+    transition_task_status(task, TaskStatus::Terminated, "terminate_task")?;
     task.updated_at = Utc::now();
     persist_store(&state, &store).await;
     Ok(Json(
@@ -668,65 +787,186 @@ async fn get_progress(
         code: "task_not_found",
         message: format!("task {} not found", task_id),
     })?;
+    Ok(Json(build_progress(task_id, task)))
+}
 
-    let done = task.step_logs.len();
-    let total = task.planned_steps.len();
-    let success = task
-        .step_logs
-        .iter()
-        .filter(|s| s.status == "success")
-        .count();
-    let failed = task
-        .step_logs
-        .iter()
-        .filter(|s| s.status == "failed")
-        .count();
+async fn task_ws(
+    ws: WebSocketUpgrade,
+    AxumPath(task_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    if !state.store.read().await.tasks.contains_key(&task_id) {
+        return Err(ApiError {
+            code: "task_not_found",
+            message: format!("task {} not found", task_id),
+        });
+    }
 
-    Ok(Json(TaskProgress {
-        task_id,
-        status: task.status.clone(),
-        total_steps: total,
-        done_steps: done,
-        success_steps: success,
-        failed_steps: failed,
-        progress_percent: if total == 0 {
-            0
-        } else {
-            ((done as f32 / total as f32) * 100.0).round() as u8
-        },
-    }))
+    Ok(ws.on_upgrade(move |socket| task_ws_loop(socket, task_id, state)))
+}
+
+async fn task_ws_loop(mut socket: WebSocket, task_id: Uuid, state: AppState) {
+    loop {
+        let payload = {
+            let store = state.store.read().await;
+            let Some(task) = store.tasks.get(&task_id) else {
+                break;
+            };
+
+            serde_json::json!({
+                "task": task,
+                "logs": task.step_logs,
+                "tool_calls": store.tool_calls.get(&task_id).cloned().unwrap_or_default(),
+                "progress": build_progress(task_id, task),
+            })
+        };
+
+        if socket
+            .send(Message::Text(payload.to_string()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+
+        let status = {
+            let store = state.store.read().await;
+            store.tasks.get(&task_id).map(|t| t.status.clone())
+        };
+
+        if matches!(
+            status,
+            Some(TaskStatus::Passed | TaskStatus::Failed | TaskStatus::Terminated)
+        ) {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 async fn get_logs(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Query(query): Query<StepLogQuery>,
 ) -> Result<Json<Vec<StepLog>>, ApiError> {
     let store = state.store.read().await;
     let task = store.tasks.get(&task_id).ok_or(ApiError {
         code: "task_not_found",
         message: format!("task {} not found", task_id),
     })?;
-    Ok(Json(task.step_logs.clone()))
+
+    let started_at = parse_optional_datetime(query.started_at.as_deref(), "started_at")?;
+    let ended_at = parse_optional_datetime(query.ended_at.as_deref(), "ended_at")?;
+    validate_time_range(started_at, ended_at)?;
+
+    let status = query.status.as_deref();
+    let logs = task
+        .step_logs
+        .iter()
+        .filter(|x| query.step_order.is_none_or(|order| x.step_order == order))
+        .filter(|x| status.is_none_or(|status| x.status.eq_ignore_ascii_case(status)))
+        .filter(|x| started_at.is_none_or(|start| x.created_at >= start))
+        .filter(|x| ended_at.is_none_or(|end| x.created_at <= end))
+        .cloned()
+        .collect();
+
+    Ok(Json(logs))
+}
+
+async fn get_failure_aggregation(
+    AxumPath(task_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+) -> Result<Json<TaskFailureAggregation>, ApiError> {
+    let store = state.store.read().await;
+    let task = store.tasks.get(&task_id).ok_or(ApiError {
+        code: "task_not_found",
+        message: format!("task {} not found", task_id),
+    })?;
+
+    let failed_logs = task
+        .step_logs
+        .iter()
+        .filter(|x| x.status.eq_ignore_ascii_case("failed"))
+        .collect::<Vec<_>>();
+
+    let failed_step_orders = failed_logs.iter().map(|x| x.step_order).collect::<Vec<_>>();
+    let failed_step_names = failed_logs
+        .iter()
+        .map(|x| x.step_name.clone())
+        .collect::<Vec<_>>();
+    let latest_failed_at = failed_logs.iter().map(|x| x.created_at).max();
+
+    let failed_tools = store
+        .tool_calls
+        .get(&task_id)
+        .into_iter()
+        .flatten()
+        .filter(|x| !x.success)
+        .map(|x| x.tool_name.clone())
+        .collect::<Vec<_>>();
+
+    Ok(Json(TaskFailureAggregation {
+        task_id,
+        failed_steps: failed_logs.len(),
+        failed_step_orders,
+        failed_step_names,
+        failed_tools,
+        latest_failed_at,
+    }))
 }
 
 async fn get_tool_calls(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Query(query): Query<ToolCallQuery>,
 ) -> Result<Json<Vec<ToolCallLog>>, ApiError> {
     let store = state.store.read().await;
-    Ok(Json(
-        store.tool_calls.get(&task_id).cloned().unwrap_or_default(),
-    ))
+    let started_at = parse_optional_datetime(query.started_at.as_deref(), "started_at")?;
+    let ended_at = parse_optional_datetime(query.ended_at.as_deref(), "ended_at")?;
+    validate_time_range(started_at, ended_at)?;
+
+    let tool_name = query.tool_name.as_deref();
+    let tool_calls = store
+        .tool_calls
+        .get(&task_id)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|x| query.step_order.is_none_or(|order| x.step_order == order))
+        .filter(|x| query.success.is_none_or(|success| x.success == success))
+        .filter(|x| tool_name.is_none_or(|name| x.tool_name.eq_ignore_ascii_case(name)))
+        .filter(|x| started_at.is_none_or(|start| x.created_at >= start))
+        .filter(|x| ended_at.is_none_or(|end| x.created_at <= end))
+        .collect::<Vec<_>>();
+
+    Ok(Json(tool_calls))
 }
 
 async fn get_snapshots(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<Vec<PageSnapshot>>, ApiError> {
     let store = state.store.read().await;
-    Ok(Json(
-        store.snapshots.get(&task_id).cloned().unwrap_or_default(),
-    ))
+    let started_at = parse_optional_datetime(query.started_at.as_deref(), "started_at")?;
+    let ended_at = parse_optional_datetime(query.ended_at.as_deref(), "ended_at")?;
+    validate_time_range(started_at, ended_at)?;
+
+    let current_page = query.current_page.as_deref();
+    let snapshots = store
+        .snapshots
+        .get(&task_id)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|x| query.step_order.is_none_or(|order| x.step_order == order))
+        .filter(|x| current_page.is_none_or(|page| x.current_page.eq_ignore_ascii_case(page)))
+        .filter(|x| started_at.is_none_or(|start| x.created_at >= start))
+        .filter(|x| ended_at.is_none_or(|end| x.created_at <= end))
+        .collect::<Vec<_>>();
+
+    Ok(Json(snapshots))
 }
 
 async fn get_report(
@@ -762,34 +1002,55 @@ async fn get_bug_report(
 async fn export_report_markdown(
     AxumPath(task_id): AxumPath<Uuid>,
     State(state): State<AppState>,
-) -> Result<String, ApiError> {
+    axum::extract::Query(query): axum::extract::Query<ExportReportQuery>,
+) -> Result<Response, ApiError> {
     let store = state.store.read().await;
     let report = store.reports.get(&task_id).ok_or(ApiError {
         code: "report_not_ready",
         message: "report not generated".to_string(),
     })?;
 
-    let mut md = format!(
-        "# 测试报告\n\n- task_id: {}\n- result: {:?}\n- summary: {}\n- issue_summary: {}\n\n## 执行步骤\n",
-        report.task_id, report.result, report.summary, report.issue_summary
-    );
+    let format = query.format.unwrap_or_else(|| "markdown".to_string());
+    let markdown = render_report_markdown(report, query.template.as_deref());
 
-    for step in &report.steps {
-        md.push_str(&format!(
-            "- [{}] {} | expected: {} | actual: {}\n",
-            step.status, step.step_name, step.expected_result, step.actual_result
-        ));
+    match format.as_str() {
+        "markdown" | "md" => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/markdown; charset=utf-8"),
+            );
+            Ok((headers, markdown).into_response())
+        }
+        "html" => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            Ok((headers, markdown_to_html(&markdown)).into_response())
+        }
+        "pdf" => {
+            let pdf_bytes = render_report_pdf(report, &markdown).map_err(|e| ApiError {
+                code: "pdf_export_failed",
+                message: e,
+            })?;
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/pdf"),
+            );
+            headers.insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"report.pdf\""),
+            );
+            Ok((headers, pdf_bytes).into_response())
+        }
+        _ => Err(ApiError {
+            code: "unsupported_format",
+            message: "format only supports: markdown|html|pdf".to_string(),
+        }),
     }
-
-    if let Some(bug) = &report.bug_report {
-        md.push_str("\n## Bug 报告\n");
-        md.push_str(&format!(
-            "- title: {}\n- severity: {}\n- reason: {}\n",
-            bug.bug_title, bug.severity, bug.possible_reason
-        ));
-    }
-
-    Ok(md)
 }
 
 async fn run_task_pipeline(task_id: Uuid, state: AppState) -> Result<(), String> {
@@ -803,7 +1064,14 @@ async fn run_task_pipeline(task_id: Uuid, state: AppState) -> Result<(), String>
     };
 
     let started = Instant::now();
-    for step in task_snapshot.planned_steps.clone() {
+    let pending_steps = task_snapshot
+        .planned_steps
+        .clone()
+        .into_iter()
+        .filter(|s| s.step_order >= task_snapshot.next_step_order)
+        .collect::<Vec<_>>();
+
+    for step in pending_steps {
         if is_task_stopped_or_paused(task_id, &state).await {
             return Ok(());
         }
@@ -844,6 +1112,7 @@ async fn run_task_pipeline(task_id: Uuid, state: AppState) -> Result<(), String>
             .await;
 
             if verify.success {
+                mark_step_success(task_id, step.step_order, state.clone()).await;
                 success = true;
                 break;
             }
@@ -900,12 +1169,7 @@ async fn fail_task(
             .tasks
             .get(&task_id)
             .ok_or_else(|| "task not found".to_string())?;
-
-        let sev = if task.scenario == "login" || task.scenario == "error_prompt" {
-            "P1"
-        } else {
-            "P2"
-        };
+        let sev = evaluate_bug_severity(task, reason);
 
         (
             task.step_logs
@@ -936,6 +1200,115 @@ async fn fail_task(
     .await;
 
     Ok(())
+}
+
+fn evaluate_bug_severity(task: &TestTask, reason: &str) -> String {
+    let failed_steps = task
+        .step_logs
+        .iter()
+        .filter(|s| s.status == "failed")
+        .count();
+    let retried_steps = task.step_logs.iter().filter(|s| s.retry_count > 0).count();
+    let timed_out = reason.contains("超时");
+    let auth_scene = task.scenario == "login" || task.scenario == "error_prompt";
+
+    if timed_out || failed_steps >= 2 || (auth_scene && failed_steps >= 1) {
+        return "P1".to_string();
+    }
+    if retried_steps >= 2 || task.retries > 0 {
+        return "P2".to_string();
+    }
+    "P3".to_string()
+}
+
+fn render_report_markdown(report: &TestReport, template: Option<&str>) -> String {
+    let default_template = r#"# 测试报告
+
+- task_id: {{task_id}}
+- result: {{result}}
+- summary: {{summary}}
+- issue_summary: {{issue_summary}}
+
+## 执行步骤
+{{steps}}
+
+{{bug_section}}
+"#;
+
+    let steps = report
+        .steps
+        .iter()
+        .map(|step| {
+            format!(
+                "- [{}] {} | expected: {} | actual: {}",
+                step.status, step.step_name, step.expected_result, step.actual_result
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let bug_section = report.bug_report.as_ref().map_or_else(
+        || "## Bug 报告\n- 无".to_string(),
+        |bug| {
+            format!(
+                "## Bug 报告\n- title: {}\n- severity: {}\n- reason: {}",
+                bug.bug_title, bug.severity, bug.possible_reason
+            )
+        },
+    );
+
+    (template.unwrap_or(default_template))
+        .replace("{{task_id}}", &report.task_id.to_string())
+        .replace("{{result}}", &format!("{:?}", report.result))
+        .replace("{{summary}}", &report.summary)
+        .replace("{{issue_summary}}", &report.issue_summary)
+        .replace("{{steps}}", &steps)
+        .replace("{{bug_section}}", &bug_section)
+}
+
+fn markdown_to_html(markdown: &str) -> String {
+    let escaped = markdown
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\"><title>测试报告</title></head><body><pre>{}</pre></body></html>",
+        escaped
+    )
+}
+
+fn render_report_pdf(report: &TestReport, markdown: &str) -> Result<Vec<u8>, String> {
+    use printpdf::{BuiltinFont, Mm, PdfDocument};
+    use std::io::BufWriter;
+
+    let (doc, page, layer) = PdfDocument::new("AutoTest Report", Mm(210.0), Mm(297.0), "Layer 1");
+    let current_layer = doc.get_page(page).get_layer(layer);
+    let font = doc
+        .add_builtin_font(BuiltinFont::Helvetica)
+        .map_err(|e| format!("load pdf font failed: {}", e))?;
+
+    let mut lines = vec![
+        format!("AutoTest Report / task_id: {}", report.task_id),
+        format!("result: {:?}", report.result),
+        format!("summary: {}", report.summary),
+        "--------------------------".to_string(),
+    ];
+    lines.extend(markdown.lines().take(24).map(|x| x.to_string()));
+
+    let mut y = 285.0;
+    for line in lines {
+        if y < 10.0 {
+            break;
+        }
+        current_layer.use_text(line, 10.0, Mm(10.0), Mm(y), &font);
+        y -= 6.0;
+    }
+
+    let mut bytes = Vec::new();
+    let mut writer = BufWriter::new(&mut bytes);
+    doc.save(&mut writer)
+        .map_err(|e| format!("render pdf failed: {}", e))?;
+    Ok(bytes)
 }
 
 async fn append_step_log(
@@ -973,6 +1346,15 @@ async fn append_step_log(
     persist_store(&state, &store).await;
 }
 
+async fn mark_step_success(task_id: Uuid, step_order: u32, state: AppState) {
+    let mut store = state.store.write().await;
+    if let Some(task) = store.tasks.get_mut(&task_id) {
+        task.next_step_order = step_order + 1;
+        task.updated_at = Utc::now();
+    }
+    persist_store(&store);
+}
+
 async fn finalize_task(
     task_id: Uuid,
     status: TaskStatus,
@@ -985,8 +1367,17 @@ async fn finalize_task(
             return;
         }
 
-        task.status = status.clone();
+        if let Err(err) = transition_task_status(task, status.clone(), "finalize_task") {
+            error!(
+                "invalid finalize transition for task {}: {}",
+                task_id, err.message
+            );
+            return;
+        }
         task.updated_at = Utc::now();
+        if status == TaskStatus::Passed {
+            task.next_step_order = task.planned_steps.len() as u32 + 1;
+        }
 
         let screenshots = task
             .step_logs
@@ -1069,26 +1460,41 @@ fn planner_plan(goal: &str, params: &serde_json::Value) -> PlanResult {
             vec!["username", "password"],
             params,
             vec![
-                step(
-                    1,
-                    "识别当前是否在登录页",
-                    ActionType::Observe,
-                    serde_json::json!({}),
-                    "识别到登录页",
+                with_rules(
+                    step(
+                        1,
+                        "识别当前是否在登录页",
+                        ActionType::Observe,
+                        serde_json::json!({}),
+                        "识别到登录页",
+                    ),
+                    vec![VerifyRule::CurrentPageIs {
+                        value: "login_page".to_string(),
+                    }],
                 ),
-                step(
-                    2,
-                    "输入账号密码",
-                    ActionType::Input,
-                    serde_json::json!({"fields":["username","password"]}),
-                    "账号密码填充成功",
+                with_rules(
+                    step(
+                        2,
+                        "输入账号密码",
+                        ActionType::Input,
+                        serde_json::json!({"fields":["username","password"]}),
+                        "账号密码填充成功",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "账号输入框".to_string(),
+                    }],
                 ),
-                step(
-                    3,
-                    "点击登录按钮",
-                    ActionType::Tap,
-                    serde_json::json!({"target":"登录"}),
-                    "进入首页或出现明确错误提示",
+                with_rules(
+                    step(
+                        3,
+                        "点击登录按钮",
+                        ActionType::Tap,
+                        serde_json::json!({"target":"登录"}),
+                        "进入首页或出现明确错误提示",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "登录".to_string(),
+                    }],
                 ),
             ],
         );
@@ -1100,26 +1506,41 @@ fn planner_plan(goal: &str, params: &serde_json::Value) -> PlanResult {
             vec!["keyword"],
             params,
             vec![
-                step(
-                    1,
-                    "定位搜索框",
-                    ActionType::Observe,
-                    serde_json::json!({}),
-                    "搜索框可用",
+                with_rules(
+                    step(
+                        1,
+                        "定位搜索框",
+                        ActionType::Observe,
+                        serde_json::json!({}),
+                        "搜索框可用",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "搜索框".to_string(),
+                    }],
                 ),
-                step(
-                    2,
-                    "输入关键词",
-                    ActionType::Input,
-                    serde_json::json!({"field":"keyword"}),
-                    "关键词输入成功",
+                with_rules(
+                    step(
+                        2,
+                        "输入关键词",
+                        ActionType::Input,
+                        serde_json::json!({"field":"keyword"}),
+                        "关键词输入成功",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "搜索框".to_string(),
+                    }],
                 ),
-                step(
-                    3,
-                    "点击搜索按钮",
-                    ActionType::Tap,
-                    serde_json::json!({"target":"搜索"}),
-                    "展示搜索结果或空状态",
+                with_rules(
+                    step(
+                        3,
+                        "点击搜索按钮",
+                        ActionType::Tap,
+                        serde_json::json!({"target":"搜索"}),
+                        "展示搜索结果或空状态",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "搜索".to_string(),
+                    }],
                 ),
             ],
         );
@@ -1131,26 +1552,41 @@ fn planner_plan(goal: &str, params: &serde_json::Value) -> PlanResult {
             vec!["form_data"],
             params,
             vec![
-                step(
-                    1,
-                    "进入表单页并定位必填项",
-                    ActionType::Observe,
-                    serde_json::json!({}),
-                    "识别到必填项",
+                with_rules(
+                    step(
+                        1,
+                        "进入表单页并定位必填项",
+                        ActionType::Observe,
+                        serde_json::json!({}),
+                        "识别到必填项",
+                    ),
+                    vec![VerifyRule::CurrentPageIs {
+                        value: "form_page".to_string(),
+                    }],
                 ),
-                step(
-                    2,
-                    "填写并提交表单",
-                    ActionType::Input,
-                    serde_json::json!({"field":"form_data"}),
-                    "表单提交成功",
+                with_rules(
+                    step(
+                        2,
+                        "填写并提交表单",
+                        ActionType::Input,
+                        serde_json::json!({"field":"form_data"}),
+                        "表单提交成功",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "提交".to_string(),
+                    }],
                 ),
-                step(
-                    3,
-                    "验证成功提示",
-                    ActionType::Verify,
-                    serde_json::json!({"contains":"提交成功"}),
-                    "出现提交成功提示",
+                with_rules(
+                    step(
+                        3,
+                        "验证成功提示",
+                        ActionType::Verify,
+                        serde_json::json!({"contains":"提交成功"}),
+                        "出现提交成功提示",
+                    ),
+                    vec![VerifyRule::TextContains {
+                        value: "提交成功".to_string(),
+                    }],
                 ),
             ],
         );
@@ -1162,26 +1598,41 @@ fn planner_plan(goal: &str, params: &serde_json::Value) -> PlanResult {
             vec!["filter_condition"],
             params,
             vec![
-                step(
-                    1,
-                    "进入列表页",
-                    ActionType::Observe,
-                    serde_json::json!({}),
-                    "列表页可见",
+                with_rules(
+                    step(
+                        1,
+                        "进入列表页",
+                        ActionType::Observe,
+                        serde_json::json!({}),
+                        "列表页可见",
+                    ),
+                    vec![VerifyRule::CurrentPageIs {
+                        value: "list_page".to_string(),
+                    }],
                 ),
-                step(
-                    2,
-                    "打开筛选并选择条件",
-                    ActionType::Tap,
-                    serde_json::json!({"target":"筛选"}),
-                    "筛选条件已选择",
+                with_rules(
+                    step(
+                        2,
+                        "打开筛选并选择条件",
+                        ActionType::Tap,
+                        serde_json::json!({"target":"筛选"}),
+                        "筛选条件已选择",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "筛选".to_string(),
+                    }],
                 ),
-                step(
-                    3,
-                    "点击确认并验证列表刷新",
-                    ActionType::Verify,
-                    serde_json::json!({"contains":"filtered"}),
-                    "结果符合筛选条件",
+                with_rules(
+                    step(
+                        3,
+                        "点击确认并验证列表刷新",
+                        ActionType::Verify,
+                        serde_json::json!({"contains":"filtered"}),
+                        "结果符合筛选条件",
+                    ),
+                    vec![VerifyRule::TextContains {
+                        value: "filtered".to_string(),
+                    }],
                 ),
             ],
         );
@@ -1193,19 +1644,29 @@ fn planner_plan(goal: &str, params: &serde_json::Value) -> PlanResult {
             vec!["username", "password"],
             params,
             vec![
-                step(
-                    1,
-                    "输入错误账号密码",
-                    ActionType::Input,
-                    serde_json::json!({"invalid":true}),
-                    "错误数据输入成功",
+                with_rules(
+                    step(
+                        1,
+                        "输入错误账号密码",
+                        ActionType::Input,
+                        serde_json::json!({"invalid":true}),
+                        "错误数据输入成功",
+                    ),
+                    vec![VerifyRule::ElementExists {
+                        name: "账号输入框".to_string(),
+                    }],
                 ),
-                step(
-                    2,
-                    "点击登录并检查错误提示",
-                    ActionType::Verify,
-                    serde_json::json!({"contains":"错误"}),
-                    "出现明确错误提示",
+                with_rules(
+                    step(
+                        2,
+                        "点击登录并检查错误提示",
+                        ActionType::Verify,
+                        serde_json::json!({"contains":"错误"}),
+                        "出现明确错误提示",
+                    ),
+                    vec![VerifyRule::TextContains {
+                        value: "错误".to_string(),
+                    }],
                 ),
             ],
         );
@@ -1215,12 +1676,17 @@ fn planner_plan(goal: &str, params: &serde_json::Value) -> PlanResult {
         "generic",
         vec![],
         params,
-        vec![step(
-            1,
-            "执行通用页面可交互性检查",
-            ActionType::Observe,
-            serde_json::json!({}),
-            "页面可正常交互",
+        vec![with_rules(
+            step(
+                1,
+                "执行通用页面可交互性检查",
+                ActionType::Observe,
+                serde_json::json!({}),
+                "页面可正常交互",
+            ),
+            vec![VerifyRule::CurrentPageIs {
+                value: "generic_page".to_string(),
+            }],
         )],
     )
 }
@@ -1238,7 +1704,13 @@ fn step(
         action_type,
         action_params,
         expected_result: expected.to_string(),
+        verify_rules: vec![],
     }
+}
+
+fn with_rules(mut s: PlannedStep, rules: Vec<VerifyRule>) -> PlannedStep {
+    s.verify_rules = rules;
+    s
 }
 
 fn scenario_plan(
@@ -1279,17 +1751,29 @@ async fn observer_observe(
     .to_string();
 
     let screenshot_url = format!("s3://mock/{}/step_{}.jpg", task_id, step_order);
+    let elements = match current_page.as_str() {
+        "login_page" => vec![
+            serde_json::json!({"type":"input","name":"账号输入框","clickable":true}),
+            serde_json::json!({"type":"input","name":"密码输入框","clickable":true}),
+            serde_json::json!({"type":"button","name":"登录","clickable":true}),
+        ],
+        "search_page" => vec![
+            serde_json::json!({"type":"input","name":"搜索框","clickable":true}),
+            serde_json::json!({"type":"button","name":"搜索","clickable":true}),
+        ],
+        "form_page" => vec![
+            serde_json::json!({"type":"input","name":"姓名","clickable":true}),
+            serde_json::json!({"type":"button","name":"提交","clickable":true}),
+        ],
+        "list_page" => vec![
+            serde_json::json!({"type":"button","name":"筛选","clickable":true}),
+            serde_json::json!({"type":"list","name":"结果列表","clickable":false}),
+        ],
+        _ => vec![serde_json::json!({"type":"container","name":"页面主体","clickable":false})],
+    };
     let page_tree = serde_json::json!({
         "current_page": current_page,
-        "elements": [
-            {"type":"input","name":"账号输入框","clickable":true},
-            {"type":"input","name":"密码输入框","clickable":true},
-            {"type":"input","name":"搜索框","clickable":true},
-            {"type":"button","name":"登录","clickable":true},
-            {"type":"button","name":"搜索","clickable":true},
-            {"type":"button","name":"筛选","clickable":true},
-            {"type":"button","name":"提交","clickable":true}
-        ],
+        "elements": elements,
         "status":"ready"
     });
 
@@ -1343,12 +1827,46 @@ async fn execute_action(
 ) -> ActionResult {
     let start = Instant::now();
     let (tool_name, output) = match action.action_type {
-        ActionType::Observe => ("tree", serde_json::json!({"status":"ok"})),
-        ActionType::Tap => ("tap", serde_json::json!({"status":"ok"})),
-        ActionType::Input => ("input", serde_json::json!({"status":"ok"})),
-        ActionType::Swipe => ("swipe", serde_json::json!({"status":"ok"})),
-        ActionType::Verify => ("verify", serde_json::json!({"status":"ok"})),
-        ActionType::AgentAct => ("agent_act", serde_json::json!({"status":"ok"})),
+        ActionType::Observe => (
+            "tree",
+            serde_json::json!({"status":"ok","message":"页面结构已获取"}),
+        ),
+        ActionType::Tap => (
+            "tap",
+            serde_json::json!({"status":"ok","message":"点击成功"}),
+        ),
+        ActionType::Input => (
+            "input",
+            serde_json::json!({"status":"ok","message":"输入成功"}),
+        ),
+        ActionType::Swipe => (
+            "swipe",
+            serde_json::json!({"status":"ok","message":"滑动成功"}),
+        ),
+        ActionType::Verify => (
+            "verify",
+            serde_json::json!({"status":"ok","message":"校验动作执行"}),
+        ),
+        ActionType::AgentAct => {
+            let instruction = action
+                .action_params
+                .get("instruction")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default();
+            let message = if instruction.contains("错误提示") {
+                "错误提示已出现"
+            } else if instruction.contains("成功提示") {
+                "提交成功"
+            } else if instruction.contains("筛选") {
+                "filtered list ready"
+            } else {
+                "agent action done"
+            };
+            (
+                "agent_act",
+                serde_json::json!({"status":"ok","message":message}),
+            )
+        }
     };
 
     let log = ToolCallLog {
@@ -1393,7 +1911,17 @@ fn verifier_verify(
         .cloned()
         .unwrap_or_default();
 
-    if step.description.contains("登录") {
+    for rule in &step.verify_rules {
+        if let Some(reason) = check_verify_rule(rule, &elements, observe, action_result) {
+            return VerifyResult {
+                success: false,
+                reason,
+                actual_result: "断言失败".to_string(),
+            };
+        }
+    }
+
+    if step.verify_rules.is_empty() && step.description.contains("登录") {
         let has_login = elements.iter().any(|e| {
             e.get("name")
                 .and_then(|x| x.as_str())
@@ -1413,6 +1941,48 @@ fn verifier_verify(
         success: true,
         reason: "验证通过".to_string(),
         actual_result: format!("{}: 执行成功", step.description),
+    }
+}
+
+fn check_verify_rule(
+    rule: &VerifyRule,
+    elements: &[serde_json::Value],
+    observe: &ObserveResult,
+    action_result: &ActionResult,
+) -> Option<String> {
+    match rule {
+        VerifyRule::ElementExists { name } => {
+            let found = elements.iter().any(|e| {
+                e.get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .contains(name)
+            });
+            if found {
+                None
+            } else {
+                Some(format!("元素缺失: {}", name))
+            }
+        }
+        VerifyRule::TextContains { value } => {
+            let text = action_result
+                .output
+                .get("message")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default();
+            if text.contains(value) {
+                None
+            } else {
+                Some(format!("文本断言失败: 缺少 {}", value))
+            }
+        }
+        VerifyRule::CurrentPageIs { value } => {
+            if &observe.current_page == value {
+                None
+            } else {
+                Some(format!("页面断言失败: 当前为 {}", observe.current_page))
+            }
+        }
     }
 }
 
@@ -1451,8 +2021,153 @@ fn merge_json(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
 
 async fn persist_store(state: &AppState, store: &Store) {
     if let Err(err) = state.persistence.save_store(store).await {
+fn transition_task_status(
+    task: &mut TestTask,
+    target: TaskStatus,
+    action: &'static str,
+) -> Result<(), ApiError> {
+    if can_transition(&task.status, &target) {
+        task.status = target;
+        return Ok(());
+    }
+
+    Err(ApiError {
+        code: "invalid_status_transition",
+        message: format!(
+            "非法状态迁移: {:?} -> {:?} (action={})",
+            task.status, target, action
+        ),
+    })
+}
+
+fn can_transition(from: &TaskStatus, to: &TaskStatus) -> bool {
+    if from == to {
+        return true;
+    }
+
+    matches!(
+        (from, to),
+        (TaskStatus::Blocked, TaskStatus::Pending)
+            | (TaskStatus::Pending, TaskStatus::Blocked)
+            | (TaskStatus::Pending, TaskStatus::Running)
+            | (TaskStatus::Running, TaskStatus::Paused)
+            | (TaskStatus::Paused, TaskStatus::Running)
+            | (TaskStatus::Running, TaskStatus::Passed)
+            | (TaskStatus::Running, TaskStatus::Failed)
+            | (TaskStatus::Failed, TaskStatus::Running)
+            | (TaskStatus::Passed, TaskStatus::Running)
+            | (TaskStatus::Pending, TaskStatus::Terminated)
+            | (TaskStatus::Running, TaskStatus::Terminated)
+            | (TaskStatus::Paused, TaskStatus::Terminated)
+            | (TaskStatus::Blocked, TaskStatus::Terminated)
+            | (TaskStatus::Failed, TaskStatus::Terminated)
+    )
+}
+
+fn parse_task_status(value: &str) -> Result<TaskStatus, ApiError> {
+    match value {
+        "pending" => Ok(TaskStatus::Pending),
+        "running" => Ok(TaskStatus::Running),
+        "paused" => Ok(TaskStatus::Paused),
+        "passed" => Ok(TaskStatus::Passed),
+        "failed" => Ok(TaskStatus::Failed),
+        "blocked" => Ok(TaskStatus::Blocked),
+        "terminated" => Ok(TaskStatus::Terminated),
+        _ => Err(ApiError {
+            code: "invalid_status_filter",
+            message: format!("unsupported status filter: {}", value),
+        }),
+    }
+}
+
+fn sort_tasks(tasks: &mut [TestTask], sort_by: &str, sort_order: &str) -> Result<(), ApiError> {
+    match sort_by {
+        "created_at" => tasks.sort_by_key(|t| t.created_at),
+        "updated_at" => tasks.sort_by_key(|t| t.updated_at),
+        _ => {
+            return Err(ApiError {
+                code: "invalid_sort_by",
+                message: format!("unsupported sort_by: {}", sort_by),
+            });
+        }
+    }
+
+    match sort_order {
+        "asc" => {}
+        "desc" => tasks.reverse(),
+        _ => {
+            return Err(ApiError {
+                code: "invalid_sort_order",
+                message: format!("unsupported sort_order: {}", sort_order),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn persist_store(store: &Store) {
+    if let Err(err) = store.save() {
         error!("persist store failed: {}", err);
     }
+}
+
+fn build_progress(task_id: Uuid, task: &TestTask) -> TaskProgress {
+    let done = task.step_logs.len();
+    let total = task.planned_steps.len();
+    let success = task
+        .step_logs
+        .iter()
+        .filter(|s| s.status == "success")
+        .count();
+    let failed = task
+        .step_logs
+        .iter()
+        .filter(|s| s.status == "failed")
+        .count();
+
+    TaskProgress {
+        task_id,
+        status: task.status.clone(),
+        total_steps: total,
+        done_steps: done,
+        success_steps: success,
+        failed_steps: failed,
+        progress_percent: if total == 0 {
+            0
+        } else {
+            ((done as f32 / total as f32) * 100.0).round() as u8
+        },
+    }
+fn parse_optional_datetime(
+    raw: Option<&str>,
+    field: &str,
+) -> Result<Option<DateTime<Utc>>, ApiError> {
+    raw.map(|value| {
+        DateTime::parse_from_rfc3339(value)
+            .map(|x| x.with_timezone(&Utc))
+            .map_err(|_| ApiError {
+                code: "invalid_query_param",
+                message: format!("{} must be RFC3339 datetime", field),
+            })
+    })
+    .transpose()
+}
+
+fn validate_time_range(
+    started_at: Option<DateTime<Utc>>,
+    ended_at: Option<DateTime<Utc>>,
+) -> Result<(), ApiError> {
+    if let (Some(start), Some(end)) = (started_at, ended_at) {
+        if start > end {
+            return Err(ApiError {
+                code: "invalid_time_range",
+                message: "started_at must be earlier than or equal to ended_at".to_string(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1481,5 +2196,130 @@ mod tests {
         let raw = serde_json::json!({"username":"u","password":"abc"});
         let masked = mask_sensitive_json(&raw);
         assert_eq!(masked.get("password").unwrap(), "***");
+    }
+
+    #[test]
+    fn severity_should_be_p1_for_timeout() {
+        let task = TestTask {
+            task_id: Uuid::new_v4(),
+            task_name: "t".to_string(),
+            user_goal: "g".to_string(),
+            scenario: "search".to_string(),
+            status: TaskStatus::Failed,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            params: serde_json::json!({}),
+            required_data: vec![],
+            missing_data: vec![],
+            planned_steps: vec![],
+            step_logs: vec![],
+            retries: 0,
+            max_retries: 2,
+            max_step_retries: 2,
+            step_timeout_ms: 1000,
+            global_timeout_ms: 1000,
+        };
+        assert_eq!(evaluate_bug_severity(&task, "超过全局超时"), "P1");
+    }
+
+    #[test]
+    fn markdown_template_should_apply() {
+        let report = TestReport {
+            report_id: Uuid::new_v4(),
+            task_id: Uuid::new_v4(),
+            result: TaskStatus::Passed,
+            summary: "ok".to_string(),
+            issue_summary: "none".to_string(),
+            execution_steps: vec![],
+            actual_result: "done".to_string(),
+            expected_result: "done".to_string(),
+            steps: vec![],
+            bug_report: None,
+            screenshots: vec![],
+            created_at: Utc::now(),
+        };
+        let rendered = render_report_markdown(&report, Some("任务={{task_id}} 结果={{result}}"));
+        assert!(rendered.contains("任务="));
+        assert!(rendered.contains("结果=Passed"));
+    fn planner_step_should_include_verify_rules() {
+        let p = planner_plan("测试登录流程", &serde_json::json!({}));
+        assert!(!p.steps[0].verify_rules.is_empty());
+    }
+
+    #[test]
+    fn verify_rule_should_check_current_page() {
+        let rule = VerifyRule::CurrentPageIs {
+            value: "login_page".to_string(),
+        };
+        let observe = ObserveResult {
+            current_page: "search_page".to_string(),
+            page_tree: serde_json::json!({"elements":[]}),
+            screenshot_url: "mock.jpg".to_string(),
+        };
+        let result = check_verify_rule(
+            &rule,
+            &[],
+            &observe,
+            &ActionResult {
+                success: true,
+                output: serde_json::json!({}),
+            },
+        );
+        assert!(result.is_some());
+    fn status_transition_should_be_checked() {
+        assert!(can_transition(&TaskStatus::Pending, &TaskStatus::Running));
+        assert!(can_transition(&TaskStatus::Running, &TaskStatus::Passed));
+        assert!(!can_transition(&TaskStatus::Passed, &TaskStatus::Paused));
+    }
+
+    #[test]
+    fn sort_tasks_should_support_created_at() {
+        let now = Utc::now();
+        let old = now - chrono::Duration::seconds(10);
+        let mut tasks = vec![
+            TestTask {
+                task_id: Uuid::new_v4(),
+                task_name: "b".to_string(),
+                user_goal: "g".to_string(),
+                scenario: "search".to_string(),
+                status: TaskStatus::Pending,
+                created_at: now,
+                updated_at: now,
+                params: serde_json::json!({}),
+                required_data: vec![],
+                missing_data: vec![],
+                planned_steps: vec![],
+                step_logs: vec![],
+                retries: 0,
+                max_retries: 2,
+                max_step_retries: 2,
+                step_timeout_ms: 1000,
+                global_timeout_ms: 1000,
+            },
+            TestTask {
+                task_id: Uuid::new_v4(),
+                task_name: "a".to_string(),
+                user_goal: "g".to_string(),
+                scenario: "search".to_string(),
+                status: TaskStatus::Pending,
+                created_at: old,
+                updated_at: old,
+                params: serde_json::json!({}),
+                required_data: vec![],
+                missing_data: vec![],
+                planned_steps: vec![],
+                step_logs: vec![],
+                retries: 0,
+                max_retries: 2,
+                max_step_retries: 2,
+                step_timeout_ms: 1000,
+                global_timeout_ms: 1000,
+            },
+        ];
+
+        sort_tasks(&mut tasks, "created_at", "asc").unwrap();
+        assert_eq!(tasks[0].task_name, "a");
+        sort_tasks(&mut tasks, "created_at", "desc").unwrap();
+        assert_eq!(tasks[0].task_name, "b");
     }
 }
